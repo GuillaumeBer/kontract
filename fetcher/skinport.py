@@ -130,14 +130,19 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
             last_24h = sp_hist_item.get("last_24_hours", {}) or {}
             last_7d = sp_hist_item.get("last_7_days", {}) or {}
             last_30d = sp_hist_item.get("last_30_days", {}) or {}
+            last_90d = sp_hist_item.get("last_90_days", {}) or {}
 
             volume_24h = last_24h.get("volume")
             volume_7d  = last_7d.get("volume")
             volume_30d = last_30d.get("volume")
+            median_24h = last_24h.get("median")
             median_7d  = last_7d.get("median")
             median_30d = last_30d.get("median")
-            avg_7d     = last_7d.get("avg")
-            avg_30d    = last_30d.get("avg")
+            median_90d = last_90d.get("median")
+            avg_24h    = last_24h.get("avg")
+            avg_7d    = last_7d.get("avg")
+            avg_30d   = last_30d.get("avg")
+            avg_90d   = last_90d.get("avg")
 
             # Vérifier variation vs prix en cache
             existing = session.query(Price).filter_by(
@@ -146,7 +151,7 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
 
             if existing and existing.sell_price and new_sell:
                 # Force update if historical columns are still NULL (new columns migration)
-                if existing.median_7d is None or existing.volume_30d is None:
+                if existing.median_7d is None or existing.median_90d is None:
                     pass 
                 else:
                     variation = abs(new_sell - existing.sell_price) / existing.sell_price
@@ -162,10 +167,14 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
                 volume_24h=volume_24h,
                 volume_7d=volume_7d,
                 volume_30d=volume_30d,
+                median_24h=median_24h,
                 median_7d=median_7d,
                 median_30d=median_30d,
+                median_90d=median_90d,
+                avg_24h=avg_24h,
                 avg_7d=avg_7d,
                 avg_30d=avg_30d,
+                avg_90d=avg_90d,
                 updated_at=datetime.now(timezone.utc),
             ).on_conflict_do_update(
                 index_elements=["skin_id", "platform"],
@@ -175,10 +184,14 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
                     volume_24h=volume_24h,
                     volume_7d=volume_7d,
                     volume_30d=volume_30d,
+                    median_24h=median_24h,
                     median_7d=median_7d,
                     median_30d=median_30d,
+                    median_90d=median_90d,
+                    avg_24h=avg_24h,
                     avg_7d=avg_7d,
                     avg_30d=avg_30d,
+                    avg_90d=avg_90d,
                     updated_at=datetime.now(timezone.utc),
                 ),
             )

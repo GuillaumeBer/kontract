@@ -43,10 +43,14 @@ def _get_platform_prices(session, platform: str) -> dict[str, dict]:
             "volume_24h": r.volume_24h or 0.0,
             "volume_7d":  r.volume_7d  or 0.0,
             "volume_30d": r.volume_30d or 0.0,
+            "median_24h": r.median_24h,
             "median_7d":  r.median_7d,
             "median_30d": r.median_30d,
+            "median_90d": r.median_90d,
+            "avg_24h":    r.avg_24h,
             "avg_7d":     r.avg_7d,
             "avg_30d":    r.avg_30d,
+            "avg_90d":    r.avg_90d,
         }
         for r in rows
         if r.buy_price or r.sell_price
@@ -122,10 +126,14 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                         volume_24h=sp_data.get("volume_24h", 0.0),
                         volume_7d=sp_data.get("volume_7d", 0.0),
                         volume_30d=sp_data.get("volume_30d", 0.0),
+                        median_24h=sp_data.get("median_24h"),
                         median_7d=sp_data.get("median_7d"),
                         median_30d=sp_data.get("median_30d"),
+                        median_90d=sp_data.get("median_90d"),
+                        avg_24h=sp_data.get("avg_24h"),
                         avg_7d=sp_data.get("avg_7d"),
                         avg_30d=sp_data.get("avg_30d"),
+                        avg_90d=sp_data.get("avg_90d"),
                         source_sell=filters.source_sell,
                     ))
 

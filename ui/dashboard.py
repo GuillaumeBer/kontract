@@ -257,3 +257,29 @@ else:
                     for o in outputs
                 ])
                 st.dataframe(out_df, use_container_width=True, hide_index=True)
+
+                # --- Graphique d'évolution des prix ---
+                st.markdown("**Évolution du prix des outputs :**")
+                
+                chart_data = {}
+                for o in outputs:
+                    # On crée une série temporelle : 90j -> 30j -> 7j -> 24h -> Spot
+                    # On utilise les médianes comme demandé par l'utilisateur
+                    p90 = o.get("median_90d") or o["sell_price"]
+                    p30 = o.get("median_30d") or o["sell_price"]
+                    p7  = o.get("median_7d")  or o["sell_price"]
+                    p1  = o.get("median_24h") or o["sell_price"]
+                    p0  = o["sell_price"]
+                    
+                    chart_data[o["name"]] = [p90, p30, p7, p1, p0]
+                
+                if chart_data:
+                    # On définit l'ordre chronologique
+                    time_labels = ["90 jours", "30 jours", "7 jours", "24 heures", "Maintenant"]
+                    chart_df = pd.DataFrame(
+                        chart_data, 
+                        index=time_labels
+                    )
+                    # Forcer l'ordre via un index catégoriel pour éviter le tri alphabétique par Streamlit/Altair
+                    chart_df.index = pd.Categorical(chart_df.index, categories=time_labels, ordered=True)
+                    st.line_chart(chart_df, use_container_width=True)

@@ -101,10 +101,14 @@ class OutputSkin:
     volume_24h: float = 0.0
     volume_7d: float = 0.0
     volume_30d: float = 0.0
-    median_7d: float = None    # médiane 7 jours (Règle 1 — base prix)
-    median_30d: float = None   # médiane 30 jours (Règle 1 — base prix fallback)
-    avg_7d: float = None       # moyenne 7 jours (Règle 2 — détection tendance)
-    avg_30d: float = None      # moyenne 30 jours (Règle 2 — détection tendance)
+    median_24h: float = None
+    median_7d: float = None
+    median_30d: float = None
+    median_90d: float = None
+    avg_24h: float = None
+    avg_7d: float = None
+    avg_30d: float = None
+    avg_90d: float = None
     source_sell: str = "skinport"
     reliability: str = "stable"  # "stable" | "trending_down" | "trending_up" | "medium" | "low"
 
@@ -264,6 +268,14 @@ def calculate_ev(
             "prob": round(prob * 100, 2),
             "reliability": rel,
             "volume_7d": out.volume_7d,
+            "median_24h": out.median_24h,
+            "median_7d": out.median_7d,
+            "median_30d": out.median_30d,
+            "median_90d": out.median_90d,
+            "avg_24h": out.avg_24h,
+            "avg_7d": out.avg_7d,
+            "avg_30d": out.avg_30d,
+            "avg_90d": out.avg_90d,
         }
         for out, prob, rel in sorted(processed_outputs, key=lambda x: x[0].sell_price, reverse=True)
     ]
