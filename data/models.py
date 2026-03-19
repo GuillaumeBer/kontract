@@ -62,6 +62,9 @@ class Price(Base):
     sell_price = Column(Float, nullable=True)
     volume_24h = Column(Float, nullable=True)
     volume_7d = Column(Float, nullable=True)
+    volume_30d = Column(Float, nullable=True)
+    median_7d = Column(Float, nullable=True)
+    median_30d = Column(Float, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     skin = relationship("Skin", back_populates="prices")
@@ -95,4 +98,5 @@ class Opportunity(Base):
     roi = Column(Float, nullable=False)
     pool_size = Column(Integer, nullable=False)
     liquidity_score = Column(Float, nullable=True)
+    price_reliability = Column(String, nullable=True)  # "high" | "medium" | "low"
     created_at = Column(DateTime, default=datetime.utcnow)

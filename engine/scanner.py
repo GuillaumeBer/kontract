@@ -27,18 +27,23 @@ class UserFilters:
     max_budget: float = 100.0
     max_pool_size: int = 5
     min_liquidity: float = 3.0
+    min_price_vol_7d: int = 7  # Nouveau filtre de fiabilité
     source_buy: str = "skinport"
     source_sell: str = "skinport"
 
 
 def _get_platform_prices(session, platform: str) -> dict[str, dict]:
-    """Retourne un dict skin_id → {buy_price, sell_price, volume_24h}."""
+    """Retourne un dict skin_id → {buy_price, sell_price, volume_24h, volume_7d, volume_30d, median_7d, median_30d}."""
     rows = session.query(Price).filter_by(platform=platform).all()
     return {
         r.skin_id: {
             "buy_price": r.buy_price,
             "sell_price": r.sell_price,
             "volume_24h": r.volume_24h or 0.0,
+            "volume_7d": r.volume_7d or 0.0,
+            "volume_30d": r.volume_30d or 0.0,
+            "median_7d": r.median_7d,
+            "median_30d": r.median_30d,
         }
         for r in rows
         if r.buy_price or r.sell_price
@@ -46,6 +51,7 @@ def _get_platform_prices(session, platform: str) -> dict[str, dict]:
 
 
 def _get_output_pool(session, skin_id: str, collection_id: str) -> list[str]:
+# ... (ligne 48)
     """Retourne la liste des output_skin_id pour un input donné."""
     rows = session.query(TradeupPool).filter_by(
         input_skin_id=skin_id, collection_id=collection_id
@@ -56,13 +62,6 @@ def _get_output_pool(session, skin_id: str, collection_id: str) -> list[str]:
 def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
     """
     Scanne toutes les combinaisons de trade-up mono-collection (10 inputs identiques).
-
-    Stratégie MVP simplifiée :
-      - Pour chaque skin avec prix d'achat, calcule le trade-up de 10 inputs identiques
-      - Identifie les outputs possibles (tradeup_pool)
-      - Calcule l'EV et filtre selon les critères utilisateur
-
-    Retourne une liste de dicts avec les métriques de chaque opportunité qualifiée.
     """
     if filters is None:
         filters = UserFilters()
@@ -109,26 +108,24 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                 if len(output_ids) > filters.max_pool_size:
                     continue
 
-                # Construire les outputs avec leurs prix de vente
+                # Construire les outputs avec leurs données complètes (fallback ready)
                 outputs_list: list[OutputSkin] = []
                 for out_id in output_ids:
                     sp_data = sell_prices.get(out_id, {})
-                    sp = sp_data.get("sell_price") or sp_data.get("buy_price")
-                    if sp and sp > 0:
-                        outputs_list.append(OutputSkin(
-                            skin_id=out_id,
-                            name=skin_names.get(out_id, out_id),
-                            sell_price=sp,
-                            volume_24h=sp_data.get("volume_24h", 0.0),
-                            source_sell=filters.source_sell,
-                        ))
+                    # On passe toutes les données pour que calculate_ev fasse son fallback
+                    outputs_list.append(OutputSkin(
+                        skin_id=out_id,
+                        name=skin_names.get(out_id, out_id),
+                        sell_price=sp_data.get("sell_price") or 0.0,
+                        volume_24h=sp_data.get("volume_24h", 0.0),
+                        volume_7d=sp_data.get("volume_7d", 0.0),
+                        volume_30d=sp_data.get("volume_30d", 0.0),
+                        median_7d=sp_data.get("median_7d"),
+                        median_30d=sp_data.get("median_30d"),
+                        source_sell=filters.source_sell,
+                    ))
 
                 if not outputs_list:
-                    continue
-
-                # Vérifier liquidité minimale
-                max_vol = max(o.volume_24h for o in outputs_list)
-                if max_vol < filters.min_liquidity:
                     continue
 
                 # Construire les 10 inputs identiques
@@ -150,9 +147,14 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                         {coll_id: outputs_list},
                         source_buy=filters.source_buy,
                         source_sell=filters.source_sell,
+                        min_vol_7d=filters.min_price_vol_7d,
                     )
                     checked += 1
                 except ValueError:
+                    continue
+
+                # Vérifier liquidité minimale après redistribution
+                if result.liquidity_score * 7 < filters.min_liquidity:
                     continue
 
                 if result.roi < filters.min_roi:
@@ -169,11 +171,12 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "cout_ajuste": result.cout_ajuste,
                     "pool_size": result.pool_size,
                     "pool_score": result.pool_score,
-                    "liquidity_score": result.liquidity_score,
+                    "liquidity_score": result.liquidity_score * 7, # Repasser en /7j pour affichage
                     "win_prob": result.win_prob,
                     "jackpot_ratio": result.jackpot_ratio,
                     "ev_ajustee": result.ev_ajustee,
                     "kontract_score": result.kontract_score,
+                    "price_reliability": result.price_reliability,
                     "outputs": result.outputs,
                 })
 

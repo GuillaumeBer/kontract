@@ -299,21 +299,29 @@ scheduler.add_job(fetch_skinport_prices, "interval", minutes=5)
 prob(output_X in A) = (7/10) × (1 / nb_outputs_tier_sup_A)
 prob(output_Y in B) = (3/10) × (1 / nb_outcomes_tier_sup_B)
 
-# ÉTAPE 2 : EV brute
-EV_brute = Σ (prob_i × prix_vente_output_i)
+# ÉTAPE 2 : Détermination du prix de vente espéré — logique de fallback
+# Le prix de vente d'un output n'est pas le prix spot, mais la médiane historique.
+def get_sell_price(out):
+    if out.volume_7d >= min_vol_7d: return out.median_7d, "high"
+    if out.volume_30d >= 15:        return out.median_30d, "medium"
+    if out.sell_price > 0:          return out.sell_price, "low"
+    return None, "insufficient"
 
-# ÉTAPE 3 : Coût ajusté selon plateforme achat
-# Skinport = 5% acheteur | Steam = 15% | BUFF163 = 2.5% (phase 2)
-cout_ajuste = Σ prix_input_j × (1 - frais_achat)
+# ÉTAPE 3 : EV brute + redistribution
+# Si un output est "insufficient", son poids est redistribué proportionnellement aux autres.
+EV_brute = Σ (prob_redistribuée_i × prix_fallback_i)
 
-# ÉTAPE 4 : EV nette après frais de vente
+# ÉTAPE 4 : Coût ajusté selon plateforme achat
+# Skinport = 5% acheteur | Steam = 15%
+cout_ajuste = Σ prix_input_j × (1 + frais_achat)
+
+# ÉTAPE 5 : EV nette après frais de vente
 # Skinport = 3% vendeur | Steam = 15%
 EV_nette = EV_brute × (1 - frais_vente) - cout_ajuste
 
-# ÉTAPE 5 : ROI et métriques scoring
+# ÉTAPE 6 : ROI et métriques scoring
 ROI        = (EV_nette / cout_ajuste) × 100
-pool_score = 1 / nb_outcomes_total    # haut = pool concentré
-liquidity  = volume_output_24h        # ventes/jour sur Skinport
+reliability = min(reliability_of_all_outputs)  # Score global de l'opportunité
 win_prob   = Σ prob_i où prix_output_i > cout_ajuste
 ```
 
@@ -323,8 +331,9 @@ win_prob   = Σ prob_i où prix_output_i > cout_ajuste
 |---------|--------|-------|---------------|--------|
 | ROI minimum | 10% | 5–50% | Moteur EV | Filtre principal de rentabilité |
 | Pool max (nb outcomes) | 5 | 1–20 | ByMykel collections | Concentration — différenciateur clé |
-| Volume min output (ventes/j) | 3 | 1–50 | Skinport /v1/sales/history | Liquidité à la revente |
-| Budget max inputs | 100 € | 10–10 000 € | Skinport /v1/items | Capital max par trade-up |
+| Liquidité min (ventes/7j) | 0 | 0–50 | Skinport /v1/sales/history | Liquidité à la revente |
+| Volume min prix vente (7j) | 7 | 3–30 | Skinport /v1/sales/history | Fiabilité du prix utilisé pour l'EV |
+| Budget max inputs | 200 € | 10–10 000 € | Skinport /v1/items | Capital max par trade-up |
 | Source prix achat | Skinport | Skinport / Steam | Skinport /v1/items | Impact sur le coût ajusté |
 | Source prix vente | Skinport | Skinport / Steam | Skinport /v1/items | Impact sur l'EV nette |
 

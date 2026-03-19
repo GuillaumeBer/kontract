@@ -50,12 +50,13 @@ def _opportunities_to_df(opps: list[dict]) -> pd.DataFrame:
             "Kontract Score": round(opp.get("kontract_score", 0.0), 2),
             "ROI (%)": round(opp["roi"], 1),
             "Win prob (%)": round(opp["win_prob"], 1),
+            "Fiabilité": opp.get("price_reliability", "low").upper(),
             "EV nette (€)": round(opp["ev_nette"], 2),
             "EV ajustée (€)": round(opp.get("ev_ajustee", 0.0), 2),
             "Coût 10x (€)": round(opp["cout_ajuste"], 2),
             "Pool size": opp["pool_size"],
             "Jackpot ratio": round(opp.get("jackpot_ratio", 1.0), 1),
-            "Liquidité (vol/j)": round(opp["liquidity_score"], 1),
+            "Liquidité (vol/7j)": round(opp["liquidity_score"], 1),
             "_combo_hash": opp["combo_hash"],
             "_outputs": opp.get("outputs", []),
         })
@@ -74,8 +75,11 @@ with st.sidebar:
     max_budget = st.number_input("Budget max 10x inputs (€)", min_value=10.0, max_value=10000.0,
                                   value=200.0, step=10.0)
     max_pool = st.slider("Pool max (nb outcomes)", min_value=1, max_value=20, value=5)
-    min_liquidity = st.slider("Liquidité min (ventes/j)", min_value=0.0, max_value=50.0,
+    min_liquidity = st.slider("Liquidité min (ventes/7j)", min_value=0.0, max_value=50.0,
                                value=0.0, step=1.0)
+    
+    min_vol_7d = st.slider("Volume min prix vente (7j)", min_value=3, max_value=30, value=7,
+                           help="Nombre de ventes minimum sur 7 jours pour considérer le prix médian comme fiable.")
 
     source_buy = st.selectbox("Source prix achat", ["skinport", "steam"], index=0)
     source_sell = st.selectbox("Source prix vente", ["skinport", "steam"], index=0)
@@ -100,6 +104,7 @@ if scan_btn or "opportunities" not in st.session_state:
         max_budget=max_budget,
         max_pool_size=max_pool,
         min_liquidity=min_liquidity,
+        min_price_vol_7d=min_vol_7d,
         source_buy=source_buy,
         source_sell=source_sell,
     )
@@ -168,11 +173,19 @@ else:
             return "background-color: #74c69d"
         return ""
 
+    def color_rel(val):
+        if val == "HIGH":
+            return "color: #2d6a4f; font-weight: bold"
+        elif val == "MEDIUM":
+            return "color: #d1a110; font-weight: bold"
+        return "color: #b91c1c; font-weight: bold"
+
     styled = (
         df[display_cols].style
         .applymap(color_ks, subset=["Kontract Score"])
         .applymap(color_roi, subset=["ROI (%)"])
         .applymap(color_win, subset=["Win prob (%)"])
+        .applymap(color_rel, subset=["Fiabilité"])
     )
 
     # Sélection interactive par ligne
@@ -218,9 +231,14 @@ else:
             st.markdown(f"**EV ajustée** : {selected.get('ev_ajustee', 0):.2f}€ *(EV × win prob)*")
             st.markdown(f"**ROI** : {selected['roi']:.1f}%")
             st.markdown(f"**Win probability** : {selected['win_prob']:.1f}%")
+            
+            rel = selected.get("price_reliability", "low").upper()
+            rel_color = "🟢" if rel == "HIGH" else "🟡" if rel == "MEDIUM" else "🔴"
+            st.markdown(f"**Fiabilité prix** : {rel_color} {rel}")
+            
             st.markdown(f"**Pool size** : {selected['pool_size']} outcomes possibles")
             st.markdown(f"**Jackpot ratio** : {selected.get('jackpot_ratio', 1):.1f}× *(1.0 = uniformes)*")
-            st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f} ventes/j")
+            st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f} ventes/7j")
 
         with d2:
             outputs = selected.get("outputs", [])
@@ -231,7 +249,8 @@ else:
                         "Skin": o["name"],
                         "Prob (%)": o["prob"],
                         "Prix vente (€)": o["sell_price"],
-                        "Vol 24h": o["volume_24h"],
+                        "Fiabilité": o.get("reliability", "low").upper(),
+                        "Vol 7j": o.get("volume_7d", 0),
                     }
                     for o in outputs
                 ])
