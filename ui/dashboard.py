@@ -47,11 +47,14 @@ def _opportunities_to_df(opps: list[dict]) -> pd.DataFrame:
     for opp in opps:
         rows.append({
             "Input skin": opp["input_name"],
+            "Kontract Score": round(opp.get("kontract_score", 0.0), 2),
             "ROI (%)": round(opp["roi"], 1),
+            "Win prob (%)": round(opp["win_prob"], 1),
             "EV nette (€)": round(opp["ev_nette"], 2),
+            "EV ajustée (€)": round(opp.get("ev_ajustee", 0.0), 2),
             "Coût 10x (€)": round(opp["cout_ajuste"], 2),
             "Pool size": opp["pool_size"],
-            "Win prob (%)": round(opp["win_prob"], 1),
+            "Jackpot ratio": round(opp.get("jackpot_ratio", 1.0), 1),
             "Liquidité (vol/j)": round(opp["liquidity_score"], 1),
             "_combo_hash": opp["combo_hash"],
             "_outputs": opp.get("outputs", []),
@@ -76,6 +79,14 @@ with st.sidebar:
 
     source_buy = st.selectbox("Source prix achat", ["skinport", "steam"], index=0)
     source_sell = st.selectbox("Source prix vente", ["skinport", "steam"], index=0)
+
+    st.divider()
+    sort_by = st.selectbox(
+        "Trier par",
+        ["Kontract Score", "ROI (%)", "EV nette (€)", "Win prob (%)"],
+        index=0,
+        help="Kontract Score = EV × win_prob / √jackpot_ratio × bonus_liquidité (recommandé)",
+    )
 
     scan_btn = st.button("🔍 Scanner maintenant", type="primary", use_container_width=True)
 
@@ -104,10 +115,10 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("Opportunités trouvées", len(opps))
 
 if opps:
-    col2.metric("Meilleur ROI", f"{opps[0]['roi']:.1f}%")
-    col3.metric("EV nette max", f"{opps[0]['ev_nette']:.2f}€")
-    avg_pool = sum(o["pool_size"] for o in opps) / len(opps)
-    col4.metric("Pool moyen", f"{avg_pool:.1f}")
+    best_ks = max(opps, key=lambda x: x.get("kontract_score", 0))
+    col2.metric("Meilleur Kontract Score", f"{best_ks.get('kontract_score', 0):.2f}")
+    col3.metric("Meilleur ROI", f"{opps[0]['roi']:.1f}%")
+    col4.metric("Win prob moyenne", f"{sum(o['win_prob'] for o in opps)/len(opps):.0f}%")
 
 st.divider()
 
@@ -118,19 +129,51 @@ else:
     df = _opportunities_to_df(opps)
     display_cols = [c for c in df.columns if not c.startswith("_")]
 
-    st.subheader(f"📊 {len(opps)} opportunités qualifiées")
+    # Tri selon le choix sidebar
+    sort_col_map = {
+        "Kontract Score": "Kontract Score",
+        "ROI (%)": "ROI (%)",
+        "EV nette (€)": "EV nette (€)",
+        "Win prob (%)": "Win prob (%)",
+    }
+    sort_col = sort_col_map.get(sort_by, "Kontract Score")
+    df = df.sort_values(sort_col, ascending=False)
 
-    # Colorer le ROI
-    def color_roi(val):
-        if val >= 50:
+    st.subheader(f"📊 {len(opps)} opportunités qualifiées — triées par {sort_by}")
+
+    def color_ks(val):
+        if val >= 0.5:
             return "background-color: #1a472a; color: white"
-        elif val >= 20:
+        elif val >= 0.2:
             return "background-color: #2d6a4f; color: white"
-        elif val >= 10:
+        elif val >= 0.1:
             return "background-color: #74c69d"
         return ""
 
-    styled = df[display_cols].style.applymap(color_roi, subset=["ROI (%)"])
+    def color_roi(val):
+        if val >= 100:
+            return "background-color: #1a472a; color: white"
+        elif val >= 50:
+            return "background-color: #2d6a4f; color: white"
+        elif val >= 20:
+            return "background-color: #74c69d"
+        return ""
+
+    def color_win(val):
+        if val >= 100:
+            return "background-color: #1a472a; color: white"
+        elif val >= 80:
+            return "background-color: #2d6a4f; color: white"
+        elif val >= 50:
+            return "background-color: #74c69d"
+        return ""
+
+    styled = (
+        df[display_cols].style
+        .applymap(color_ks, subset=["Kontract Score"])
+        .applymap(color_roi, subset=["ROI (%)"])
+        .applymap(color_win, subset=["Win prob (%)"])
+    )
     st.dataframe(styled, use_container_width=True, height=400)
 
     # ─── Vue détail ────────────────────────────────────────────────────────────
@@ -148,12 +191,17 @@ else:
         d1, d2 = st.columns(2)
 
         with d1:
+            ks = selected.get("kontract_score", 0)
+            ks_label = "🟢 Excellent" if ks >= 0.5 else "🟡 Bon" if ks >= 0.2 else "🔴 Spéculatif" if ks < 0.1 else "🟠 Moyen"
+            st.markdown(f"**Kontract Score** : {ks:.2f} — {ks_label}")
             st.markdown(f"**Input** : {selected['input_name']}")
             st.markdown(f"**Coût 10x inputs** : {selected['cout_ajuste']:.2f}€")
             st.markdown(f"**EV nette** : {selected['ev_nette']:.2f}€")
+            st.markdown(f"**EV ajustée** : {selected.get('ev_ajustee', 0):.2f}€ *(EV × win prob)*")
             st.markdown(f"**ROI** : {selected['roi']:.1f}%")
             st.markdown(f"**Win probability** : {selected['win_prob']:.1f}%")
             st.markdown(f"**Pool size** : {selected['pool_size']} outcomes possibles")
+            st.markdown(f"**Jackpot ratio** : {selected.get('jackpot_ratio', 1):.1f}× *(1.0 = uniformes)*")
             st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f} ventes/j")
 
         with d2:
