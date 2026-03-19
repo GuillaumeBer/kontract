@@ -122,12 +122,15 @@ class EVResult:
     roi: float
     cout_ajuste: float
     pool_size: int
+    nb_valid_outputs: int  # outputs avec prix fiable (après redistribution)
     pool_score: float
     liquidity_score: float
     win_prob: float
     cv_pond: float         # coeff. de variation pondéré par probabilité (remplace jackpot_ratio)
     ev_ajustee: float      # EV nette × win_prob (conservé pour affichage, non utilisé dans le score)
+    floor_ratio: float     # min(prix_outputs) × (1 - frais_vente) / cout_ajuste
     kontract_score: float
+    high_volatility: bool = False   # True si ≥1 output avec variation 24h > 15% vs avg_7d
     price_reliability: str = "low"  # "high" | "medium" | "low"
     outputs: list[dict] = field(default_factory=list)
 
@@ -139,6 +142,7 @@ def calculate_ev(
     source_sell: str = "skinport",
     min_vol_7d: int = 7,
     exclude_trending_down: bool = False,
+    input_trend: float = 0.0,  # (avg_24h - avg_7d) / avg_7d des inputs — détection recipe velocity
 ) -> EVResult:
     """
     Calcule l'EV avec fallback sur les prix, détection de tendance et redistribution.
@@ -231,6 +235,7 @@ def calculate_ev(
     overall_reliability = {3: "high", 2: "medium", 1: "low"}[min_rank]
 
     pool_size = len(processed_outputs)
+    nb_valid_outputs = pool_size
 
     # ÉTAPE 3 — EV brute = Σ(prob_i × prix_vente_redistribué_i)
     ev_brute = sum(prob * out.sell_price for out, prob, _ in processed_outputs)
@@ -258,29 +263,38 @@ def calculate_ev(
     ev_ajustee = ev_nette * win_prob
 
     # ── Coefficient de variation pondéré (spec §4.6 — remplace jackpot_ratio) ──
-    # cv_pond pénalise correctement les pools asymétriques pondérés par probabilité
     mean_pond = sum(prob * out.sell_price for out, prob, _ in processed_outputs)
     var_pond  = sum(prob * (out.sell_price - mean_pond) ** 2 for out, prob, _ in processed_outputs)
     cv_pond   = math.sqrt(var_pond) / mean_pond if mean_pond > 0 else 1.0
-    score_risque = ev_ajustee / math.sqrt(max(cv_pond, 0.01))
+
+    # ── Floor ratio (spec §4.6 — protection pire outcome) ──
+    min_output_price = min(out.sell_price for out, _, _ in processed_outputs)
+    floor_ratio = (min_output_price * (1 - fee_sell)) / cout_ajuste if cout_ajuste > 0 else 0.0
+    floor_factor = 1.0 if floor_ratio >= 0.20 else (0.5 + floor_ratio * 2.5)
 
     # ── Détection haute volatilité 24h (spec §4.3 Étape 2b) ──
-    # Pénalité ×0.70 si au moins un output a une variation 24h > 15% vs avg_7d
     high_volatility = False
     for out, _, _ in processed_outputs:
         if out.avg_7d and out.avg_7d > 0 and out.avg_24h:
-            vol_change = abs(out.avg_24h - out.avg_7d) / out.avg_7d
-            if vol_change > 0.15:
+            if abs(out.avg_24h - out.avg_7d) / out.avg_7d > 0.15:
                 high_volatility = True
                 break
     volatility_factor = 0.70 if high_volatility else 1.00
 
-    # ── Kontract Score — Sharpe-like (spec §4.6, corrigé double-comptage) ──
-    # EV est déjà une somme pondérée par les probabilités (Σ prob_i × prix_i).
-    # Multiplier par win_prob double-compterait la probabilité de gain — à éviter.
-    # Formule : Score = (EV_nette / √cv_pond) × (1 + bonus_liquidité) × volatility_factor
+    # ── Recipe velocity penalty (spec §4.7) ──
+    # input_trend = (avg_24h_inputs - avg_7d_inputs) / avg_7d_inputs
+    # Si les inputs montent > 10% en 24h, le trade-up est probablement en train d'être saturé.
+    velocity_penalty = max(0.5, 1.0 - input_trend) if input_trend > 0.10 else 1.0
+
+    # ── Kontract Score v3 (spec §4.6) ──
     bonus_liquidite = math.log1p(liquidity_score)
-    kontract_score = (ev_nette / math.sqrt(max(cv_pond, 0.01))) * (1 + bonus_liquidite) * volatility_factor
+    kontract_score = (
+        (ev_nette / math.sqrt(max(cv_pond, 0.01)))
+        * floor_factor
+        * (1 + bonus_liquidite)
+        * velocity_penalty
+        * volatility_factor
+    )
 
     # ev_ajustee conservé pour affichage (win_prob en %) mais pas dans la formule du score
     ev_ajustee = ev_nette * win_prob
@@ -311,12 +325,15 @@ def calculate_ev(
         roi=round(roi, 2),
         cout_ajuste=round(cout_ajuste, 4),
         pool_size=pool_size,
+        nb_valid_outputs=nb_valid_outputs,
         pool_score=round(pool_score, 4),
         liquidity_score=round(liquidity_score, 2),
         win_prob=round(win_prob * 100, 2),
         cv_pond=round(cv_pond, 4),
         ev_ajustee=round(ev_ajustee, 4),
+        floor_ratio=round(floor_ratio, 4),
         kontract_score=round(kontract_score, 4),
+        high_volatility=high_volatility,
         price_reliability=overall_reliability,
         outputs=outputs_detail,
     )
