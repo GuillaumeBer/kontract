@@ -63,6 +63,7 @@ class Price(Base):
     volume_24h = Column(Float, nullable=True)
     volume_7d  = Column(Float, nullable=True)
     volume_30d = Column(Float, nullable=True)
+    quantity   = Column(Integer, nullable=True)  # unités disponibles sur Skinport
     median_24h = Column(Float, nullable=True)
     median_7d  = Column(Float, nullable=True)
     median_30d = Column(Float, nullable=True)

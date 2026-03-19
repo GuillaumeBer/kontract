@@ -55,7 +55,7 @@ def _opportunities_to_df(opps: list[dict]) -> pd.DataFrame:
             "EV ajustée (€)": round(opp.get("ev_ajustee", 0.0), 2),
             "Coût 10x (€)": round(opp["cout_ajuste"], 2),
             "Pool size": opp["pool_size"],
-            "Jackpot ratio": round(opp.get("jackpot_ratio", 1.0), 1),
+            "CV pondéré": round(opp.get("cv_pond", 1.0), 3),
             "Liquidité": round(opp["liquidity_score"], 1),
             "_combo_hash": opp["combo_hash"],
             "_outputs": opp.get("outputs", []),
@@ -91,7 +91,7 @@ with st.sidebar:
         "Trier par",
         ["Kontract Score", "ROI (%)", "EV nette (€)", "Win prob (%)"],
         index=0,
-        help="Kontract Score = EV × win_prob / √jackpot_ratio × bonus_liquidité (recommandé)",
+        help="Kontract Score = EV / √cv_pond × bonus_liquidité (Sharpe-like — exclut le double-comptage win_prob)",
     )
 
     scan_btn = st.button("🔍 Scanner maintenant", type="primary", use_container_width=True)
@@ -240,7 +240,7 @@ else:
             st.markdown(f"**Fiabilité prix** : {rel_color} {rel}")
             
             st.markdown(f"**Pool size** : {selected['pool_size']} outcomes possibles")
-            st.markdown(f"**Jackpot ratio** : {selected.get('jackpot_ratio', 1):.1f}×")
+            st.markdown(f"**CV pondéré** : {selected.get('cv_pond', 1):.3f} (0 = outputs équilibrés, ↑ = asymétrie)") 
             st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f}")
 
         with d2:

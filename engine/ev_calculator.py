@@ -13,10 +13,12 @@ Formule EV en 5 étapes (spec §4.3) :
 import math
 from dataclasses import dataclass, field
 
-# Frais par plateforme
+# Frais par plateforme (spec §4.3 — centralisés et versionnés)
+# Skinport : frais acheteur = 0% (prix affiché = prix payé), 3% côté vendeur
+# Steam    : prix affiché inclut déjà les 15% vendeur — 0% frais acheteur supplémentaires
 FEES = {
-    "skinport": {"buy": 0.05, "sell": 0.03},
-    "steam":    {"buy": 0.15, "sell": 0.15},
+    "skinport": {"buy": 0.00, "sell": 0.03},
+    "steam":    {"buy": 0.00, "sell": 0.15},
 }
 
 
@@ -123,8 +125,8 @@ class EVResult:
     pool_score: float
     liquidity_score: float
     win_prob: float
-    jackpot_ratio: float
-    ev_ajustee: float
+    cv_pond: float         # coeff. de variation pondéré par probabilité (remplace jackpot_ratio)
+    ev_ajustee: float      # EV nette × win_prob (conservé pour affichage, non utilisé dans le score)
     kontract_score: float
     price_reliability: str = "low"  # "high" | "medium" | "low"
     outputs: list[dict] = field(default_factory=list)
@@ -233,7 +235,7 @@ def calculate_ev(
     # ÉTAPE 3 — EV brute = Σ(prob_i × prix_vente_redistribué_i)
     ev_brute = sum(prob * out.sell_price for out, prob, _ in processed_outputs)
 
-    # ÉTAPE 4 — Coût ajusté
+    # ÉTAPE 4 — Coût ajusté (spec §4.3 : frais acheteur s'*ajoutent* au prix, (1 + fee_buy))
     cout_ajuste = sum(inp.buy_price * (1 + fee_buy) for inp in inputs)
 
     # ÉTAPE 5 — EV nette
@@ -241,24 +243,47 @@ def calculate_ev(
     roi = (ev_nette / cout_ajuste) * 100 if cout_ajuste > 0 else 0.0
 
     pool_score = 1 / pool_size
-    liquidity_score = max((out.volume_7d or 0 for out, _, _ in processed_outputs), default=0.0) / 7.0 # normalisé / 7j
 
+    # Liquidité output pondérée par probabilité (spec §4.6 — remplace max())
+    liquidity_score = sum(
+        prob * (out.volume_7d or 0) for out, prob, _ in processed_outputs
+    ) / 7.0
+
+    # win_prob sur prix NET après frais (spec §4.6 Étape 1 — corrigé)
     win_prob = sum(
         prob for out, prob, _ in processed_outputs
         if out.sell_price * (1 - fee_sell) > cout_ajuste
     )
 
-    prices = [out.sell_price for out, _, _ in processed_outputs]
-    max_price = max(prices)
-    mean_price = sum(prices) / len(prices)
-    jackpot_ratio = max_price / mean_price if mean_price > 0 else 1.0
+    ev_ajustee = ev_nette * win_prob
 
-    ev_ajustee = ev_nette * win_prob # win_prob est entre 0 et 1 ici après sum(prob)
+    # ── Coefficient de variation pondéré (spec §4.6 — remplace jackpot_ratio) ──
+    # cv_pond pénalise correctement les pools asymétriques pondérés par probabilité
+    mean_pond = sum(prob * out.sell_price for out, prob, _ in processed_outputs)
+    var_pond  = sum(prob * (out.sell_price - mean_pond) ** 2 for out, prob, _ in processed_outputs)
+    cv_pond   = math.sqrt(var_pond) / mean_pond if mean_pond > 0 else 1.0
+    score_risque = ev_ajustee / math.sqrt(max(cv_pond, 0.01))
 
-    # Score composite
-    score_risque = ev_ajustee / math.sqrt(max(jackpot_ratio, 1.0))
+    # ── Détection haute volatilité 24h (spec §4.3 Étape 2b) ──
+    # Pénalité ×0.70 si au moins un output a une variation 24h > 15% vs avg_7d
+    high_volatility = False
+    for out, _, _ in processed_outputs:
+        if out.avg_7d and out.avg_7d > 0 and out.avg_24h:
+            vol_change = abs(out.avg_24h - out.avg_7d) / out.avg_7d
+            if vol_change > 0.15:
+                high_volatility = True
+                break
+    volatility_factor = 0.70 if high_volatility else 1.00
+
+    # ── Kontract Score — Sharpe-like (spec §4.6, corrigé double-comptage) ──
+    # EV est déjà une somme pondérée par les probabilités (Σ prob_i × prix_i).
+    # Multiplier par win_prob double-compterait la probabilité de gain — à éviter.
+    # Formule : Score = (EV_nette / √cv_pond) × (1 + bonus_liquidité) × volatility_factor
     bonus_liquidite = math.log1p(liquidity_score)
-    kontract_score = score_risque * (1 + bonus_liquidite)
+    kontract_score = (ev_nette / math.sqrt(max(cv_pond, 0.01))) * (1 + bonus_liquidite) * volatility_factor
+
+    # ev_ajustee conservé pour affichage (win_prob en %) mais pas dans la formule du score
+    ev_ajustee = ev_nette * win_prob
 
     outputs_detail = [
         {
@@ -289,7 +314,7 @@ def calculate_ev(
         pool_score=round(pool_score, 4),
         liquidity_score=round(liquidity_score, 2),
         win_prob=round(win_prob * 100, 2),
-        jackpot_ratio=round(jackpot_ratio, 2),
+        cv_pond=round(cv_pond, 4),
         ev_ajustee=round(ev_ajustee, 4),
         kontract_score=round(kontract_score, 4),
         price_reliability=overall_reliability,

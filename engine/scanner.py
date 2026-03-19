@@ -43,6 +43,8 @@ def _get_platform_prices(session, platform: str) -> dict[str, dict]:
             "volume_24h": r.volume_24h or 0.0,
             "volume_7d":  r.volume_7d  or 0.0,
             "volume_30d": r.volume_30d or 0.0,
+            "quantity":   r.quantity,
+            "median_price": r.sell_price,  # on utilise sell_price comme référence
             "median_24h": r.median_24h,
             "median_7d":  r.median_7d,
             "median_30d": r.median_30d,
@@ -63,6 +65,43 @@ def _get_output_pool(session, skin_id: str, collection_id: str) -> list[str]:
         input_skin_id=skin_id, collection_id=collection_id
     ).all()
     return [r.output_skin_id for r in rows]
+
+
+def is_price_anomaly(min_price: float, median_price: float) -> bool:
+    """
+    Détecte un min_price anormal vs la médiane (spec §4.4).
+    Retourne True si le prix doit être ignoré, fallback sur médiane.
+    """
+    if not median_price or median_price == 0:
+        return True
+    ratio = min_price / median_price
+    return ratio < 0.5 or ratio > 2.0
+
+
+def check_input_liquidity(quantity: int | None, qty_needed: int = 10) -> str:
+    """
+    Évalue le statut de liquidité des inputs selon la quantité disponible (spec §4.5).
+    Retourne : 'out_of_stock' | 'scarce' | 'partial' | 'liquid'
+    """
+    if not quantity or quantity == 0:
+        return "out_of_stock"
+    if quantity >= qty_needed:
+        return "liquid"
+    if quantity >= qty_needed // 2:
+        return "partial"
+    return "scarce"
+
+
+def validate_tradeup(skins: list) -> tuple[bool, str]:
+    """
+    Vérifie que la composition des inputs est valide selon les règles Valve (spec §4.4).
+    """
+    stattrak_vals = {getattr(s, 'stattrak', False) for s in skins}
+    if len(stattrak_vals) > 1:
+        return False, "stattrak_mixte"
+    if any(getattr(s, 'souvenir', False) for s in skins):
+        return False, "souvenir_interdit"
+    return True, "valid"
 
 
 def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
@@ -102,9 +141,23 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                 continue
 
             bp_data = buy_prices.get(skin_id, {})
-            buy_price = bp_data.get("buy_price")
+            raw_buy  = bp_data.get("buy_price")
+            med_buy  = bp_data.get("median_price")
+            quantity = bp_data.get("quantity")
+
+            # Détection anomalie min_price (spec §4.4 — fallback sur médiane)
+            if raw_buy and med_buy and is_price_anomaly(raw_buy, med_buy):
+                buy_price = med_buy
+            else:
+                buy_price = raw_buy
+
             if not buy_price or buy_price <= 0:
                 continue
+
+            # Vérification liquidité inputs (spec §4.5)
+            input_liquidity = check_input_liquidity(quantity, qty_needed=10)
+            if input_liquidity == "out_of_stock":
+                continue  # inexécutable — rejet
 
             cost_10 = buy_price * 10
             if cost_10 > filters.max_budget:
@@ -186,7 +239,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "pool_score": result.pool_score,
                     "liquidity_score": result.liquidity_score * 7, # Repasser en /7j pour affichage
                     "win_prob": result.win_prob,
-                    "jackpot_ratio": result.jackpot_ratio,
+                    "cv_pond": result.cv_pond,
                     "ev_ajustee": result.ev_ajustee,
                     "kontract_score": result.kontract_score,
                     "price_reliability": result.price_reliability,
