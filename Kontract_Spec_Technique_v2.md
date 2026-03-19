@@ -325,6 +325,78 @@ reliability = min(reliability_of_all_outputs)  # Score global de l'opportunité
 win_prob   = Σ prob_i où prix_output_i > cout_ajuste
 ```
 
+#### Détermination du prix de vente espéré
+
+Le prix de vente d'un output est calculé via `get_sell_price()` qui applique quatre règles successives : fenêtre temporelle adaptative selon le volume, détection de tendance baissière ou haussière, ajustement conservateur du prix, et cross-check multi-sources à partir de la V1.
+
+La médiane est préférée à la moyenne car elle est naturellement résistante aux outliers. Éliminer les outliers manuellement n'est donc pas nécessaire — à condition que le seuil de volume minimum soit respecté.
+
+**Règle 1 — Fenêtre temporelle adaptative (seuil absolu : 30 ventes)**
+
+On choisit la fenêtre la plus courte qui atteint 30 ventes, ce qui garantit une médiane robuste quelle que soit la liquidité du skin.
+
+```
+volume 7j  ≥ 30  → médiane 7j   (skin liquide — 4+ ventes/jour)
+volume 30j ≥ 30  → médiane 30j  (skin peu liquide — ~1 vente/jour)
+aucune fenêtre   → insufficient_data → exclu du scan
+```
+
+> Pourquoi 30 ? En dessous, une seule transaction aberrante peut représenter 5–10% du volume et biaiser la médiane de façon significative.
+
+**Règle 2 — Détection de tendance**
+
+Le biais le plus dangereux : calculer l'EV sur une médiane 7j de 60€ alors que le skin était à 80€ il y a 30 jours et continue de baisser. Dans 2 semaines au moment de vendre, le prix réel sera peut-être 40€.
+
+```python
+avg_7d  = history["last_7_days"]["avg"]
+avg_30d = history["last_30_days"]["avg"]
+trend   = (avg_7d - avg_30d) / avg_30d
+
+# trend < -0.15 → baisse > 15%  → trending_down
+# trend > +0.15 → hausse > 15%  → trending_up
+# |trend| ≤ 0.15 → stable       → stable
+```
+
+**Règle 3 — Ajustement conservateur du prix**
+
+```python
+if trend < -0.15:
+    # Pénalité partielle à 50% — on anticipe sans projeter linéairement
+    adjusted_price = base_price * (1 + trend * 0.5)
+    reliability = "trending_down"
+elif trend > +0.15:
+    # Pas de surpondération haussière
+    adjusted_price = base_price
+    reliability = "trending_up"
+else:
+    adjusted_price = base_price
+    reliability = "stable"
+```
+
+**Règle 4 — Cross-check multi-sources (V1+)**
+
+Skinport représente une fraction du marché mondial. À partir de la V1, le prix Steam est croisé :
+
+```python
+if steam_data and steam_data.get("median"):
+    divergence = abs(adjusted_price - steam_data["median"]) / adjusted_price
+    if divergence > 0.20:
+        adjusted_price = min(adjusted_price, steam_data["median"])
+        reliability += "_price_divergence"
+```
+
+À partir de la V2, BUFF163 devient la référence principale pour les skins de haute valeur (couteaux, gants).
+
+**Sources de prix par phase**
+
+| Phase | Source principale | Source secondaire | Référence haute valeur |
+|-------|------------------|------------------|----------------------|
+| MVP | Skinport (médiane ajustée) | — | — |
+| V1 | Skinport (médiane ajustée) | Steam Market (cross-check) | — |
+| V2+ | Skinport | Steam Market | BUFF163 (couteaux / gants) |
+
+---
+
 #### Critères de filtrage — configurables par utilisateur
 
 | Critère | Défaut | Plage | Source données | Impact |
@@ -332,8 +404,9 @@ win_prob   = Σ prob_i où prix_output_i > cout_ajuste
 | ROI minimum | 10% | 5–50% | Moteur EV | Filtre principal de rentabilité |
 | Pool max (nb outcomes) | 5 | 1–20 | ByMykel collections | Concentration — différenciateur clé |
 | Liquidité min (ventes/7j) | 0 | 0–50 | Skinport /v1/sales/history | Liquidité à la revente |
-| Volume min prix vente (7j) | 7 | 3–30 | Skinport /v1/sales/history | Fiabilité du prix utilisé pour l'EV |
 | Budget max inputs | 200 € | 10–10 000 € | Skinport /v1/items | Capital max par trade-up |
+| Volume min prix vente | 30 ventes | 10–100 | Skinport /v1/sales/history | Fiabilité statistique de la médiane (Règle 1) |
+| Exclure tendance baissière | Non | Oui / Non | Skinport /v1/sales/history | Éliminer automatiquement les outputs dont le prix baisse > 15% sur 30j |
 | Source prix achat | Skinport | Skinport / Steam | Skinport /v1/items | Impact sur le coût ajusté |
 | Source prix vente | Skinport | Skinport / Steam | Skinport /v1/items | Impact sur l'EV nette |
 

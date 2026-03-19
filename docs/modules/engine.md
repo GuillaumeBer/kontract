@@ -28,9 +28,18 @@ class InputSkin:
 class OutputSkin:
     skin_id: str
     name: str
-    sell_price: float      # prix de vente attendu hors frais
+    sell_price: float      # prix de vente attendu ajusté (hors frais), via get_sell_price()
     volume_24h: float      # ventes/jour (score liquidité)
     source_sell: str       # "skinport" | "steam"
+    reliability: str       # "stable" | "trending_down" | "trending_up" | "*_price_divergence"
+```
+
+**`SellPriceResult`**
+```python
+@dataclass
+class SellPriceResult:
+    adjusted_price: float
+    reliability: str  # "stable" | "trending_down" | "trending_up" | "*_price_divergence"
 ```
 
 **`EVResult`**
@@ -72,6 +81,35 @@ class EVResult:
   win_prob   = Σ prob_i où (prix_output_i × (1 - fee_sell)) > cout_ajuste
 ```
 
+#### `get_sell_price(price_data, steam_data=None) -> SellPriceResult | None`
+
+Détermine le prix de vente ajusté selon 4 règles (spec §4.3). Retourne `None` si les données sont insuffisantes.
+
+**Comportement par cas :**
+
+| Cas | Condition | `adjusted_price` | `reliability` |
+|-----|-----------|-----------------|---------------|
+| Liquide stable | `volume_7d ≥ 30`, `\|trend\| ≤ 15%` | `avg_7d` | `"stable"` |
+| Liquide en baisse | `volume_7d ≥ 30`, `trend < -15%` | `avg_7d × (1 + trend × 0.5)` | `"trending_down"` |
+| Liquide en hausse | `volume_7d ≥ 30`, `trend > +15%` | `avg_7d` (inchangé) | `"trending_up"` |
+| Peu liquide stable | `volume_30d ≥ 30` | `avg_30d` | `"stable"` |
+| Données insuffisantes | volume < 30 sur toutes fenêtres | — | `None` |
+
+**Exemple :**
+```python
+from engine.ev_calculator import get_sell_price
+
+# Skin en baisse de 20%
+r = get_sell_price({"volume_7d": 50, "avg_7d": 8.0, "avg_30d": 10.0, "volume_30d": 100})
+# SellPriceResult(adjusted_price=9.0, reliability="trending_down")
+
+# Données insuffisantes
+r = get_sell_price({"volume_7d": 5, "avg_7d": 10.0, "volume_30d": 10, "avg_30d": None})
+# None → output exclu du scan
+```
+
+---
+
 #### Frais par plateforme
 
 | Plateforme | Frais achat | Frais vente |
@@ -106,10 +144,12 @@ Scan de toutes les combinaisons de trade-up valides en BDD.
 ```python
 @dataclass
 class UserFilters:
-    min_roi: float = 10.0          # ROI minimum (%)
-    max_budget: float = 100.0      # budget max pour 10 inputs (€)
-    max_pool_size: int = 5         # nb max d'outputs possibles
-    min_liquidity: float = 3.0     # volume ventes/jour min sur les outputs
+    min_roi: float = 10.0               # ROI minimum (%)
+    max_budget: float = 100.0           # budget max pour 10 inputs (€)
+    max_pool_size: int = 5              # nb max d'outputs possibles
+    min_liquidity: float = 3.0          # volume ventes/jour min sur les outputs
+    min_volume_sell_price: int = 30     # ventes min pour fiabilité statistique (plage 10–100)
+    exclude_trending_down: bool = False # exclure outputs en baisse > 15% sur 30j
     source_buy: str = "skinport"
     source_sell: str = "skinport"
 ```
@@ -138,9 +178,14 @@ Chaque opportunité retournée contient :
     "pool_score": 0.2,
     "liquidity_score": 0.0,  # non nul après fetch Skinport history
     "win_prob": 20.0,
-    "outputs": [...]
+    "jackpot_ratio": 1.5,
+    "ev_ajustee": 13.6,
+    "kontract_score": 3.2,
+    "outputs": [...]   # chaque output inclut "reliability" (stable / trending_down / ...)
 }
 ```
+
+Les outputs dont `get_sell_price()` retourne `None` (volume insuffisant) sont exclus silencieusement. Si `filters.exclude_trending_down=True`, les outputs en baisse > 15% sur 30j sont également exclus.
 
 #### `save_opportunities(opportunities) -> int`
 

@@ -21,6 +21,69 @@ FEES = {
 
 
 @dataclass
+class SellPriceResult:
+    adjusted_price: float
+    reliability: str  # "stable" | "trending_down" | "trending_up" | "*_price_divergence"
+
+
+def get_sell_price(price_data: dict, steam_data: dict | None = None) -> "SellPriceResult | None":
+    """
+    Calcule le prix de vente ajusté selon 4 règles (spec §4.3).
+    Retourne None si données insuffisantes (< 30 ventes sur toutes les fenêtres).
+
+    Règle 1 — Fenêtre adaptative : médiane 7j si volume_7j ≥ 30, sinon médiane 30j, sinon exclu.
+    Règle 2 — Tendance : trend = (avg_7d - avg_30d) / avg_30d (seulement si fenêtre 7j active).
+    Règle 3 — Ajustement conservateur : pénalité 50% si baisse > 15%, inchangé si hausse.
+    Règle 4 — Cross-check Steam (V1+) : min(adjusted, steam_median) si divergence > 20%.
+    """
+    volume_7d  = price_data.get("volume_7d")  or 0
+    volume_30d = price_data.get("volume_30d") or 0
+    median_7d  = price_data.get("median_7d")
+    median_30d = price_data.get("median_30d")
+    avg_7d     = price_data.get("avg_7d")
+    avg_30d    = price_data.get("avg_30d")
+
+    # Règle 1 — Fenêtre adaptative (seuil absolu : 30 ventes)
+    if volume_7d >= 30 and median_7d:
+        base_price = median_7d
+        # Règle 2 — Détection de tendance (seulement si données avg disponibles)
+        if avg_7d and avg_30d and avg_30d > 0:
+            trend = (avg_7d - avg_30d) / avg_30d
+        else:
+            trend = 0.0
+    elif volume_30d >= 30 and median_30d:
+        base_price = median_30d
+        trend = 0.0  # pas de données 7j pour détecter une tendance fiable
+    else:
+        return None  # insufficient_data → exclu du scan
+
+    # Règle 3 — Ajustement conservateur
+    if trend < -0.15:
+        # Pénalité partielle à 50% — on anticipe sans projeter linéairement
+        adjusted_price = base_price * (1 + trend * 0.5)
+        reliability = "trending_down"
+    elif trend > 0.15:
+        # Pas de surpondération haussière
+        adjusted_price = base_price
+        reliability = "trending_up"
+    else:
+        adjusted_price = base_price
+        reliability = "stable"
+
+    # Règle 4 — Cross-check multi-sources (V1+)
+    if steam_data and steam_data.get("median") and adjusted_price > 0:
+        divergence = abs(adjusted_price - steam_data["median"]) / adjusted_price
+        if divergence > 0.20:
+            adjusted_price = min(adjusted_price, steam_data["median"])
+            reliability += "_price_divergence"
+
+    return SellPriceResult(
+        adjusted_price=round(adjusted_price, 4),
+        reliability=reliability,
+    )
+
+
+@dataclass
 class InputSkin:
     skin_id: str
     name: str
@@ -34,13 +97,16 @@ class InputSkin:
 class OutputSkin:
     skin_id: str
     name: str
-    sell_price: float         # prix "spot" actuel
+    sell_price: float          # prix spot (brut Skinport) — ajusté en interne par calculate_ev
     volume_24h: float = 0.0
     volume_7d: float = 0.0
     volume_30d: float = 0.0
-    median_7d: float = None
-    median_30d: float = None
+    median_7d: float = None    # médiane 7 jours (Règle 1 — base prix)
+    median_30d: float = None   # médiane 30 jours (Règle 1 — base prix fallback)
+    avg_7d: float = None       # moyenne 7 jours (Règle 2 — détection tendance)
+    avg_30d: float = None      # moyenne 30 jours (Règle 2 — détection tendance)
     source_sell: str = "skinport"
+    reliability: str = "stable"  # "stable" | "trending_down" | "trending_up" | "medium" | "low"
 
 
 @dataclass
@@ -65,10 +131,17 @@ def calculate_ev(
     outputs_by_collection: dict[str, list[OutputSkin]],
     source_buy: str = "skinport",
     source_sell: str = "skinport",
-    min_vol_7d: int = 7,  # Nouveau paramètre pour la fiabilité
+    min_vol_7d: int = 7,
+    exclude_trending_down: bool = False,
 ) -> EVResult:
     """
-    Calcule l'EV avec logique de fallback sur les prix de vente et redistribution.
+    Calcule l'EV avec fallback sur les prix, détection de tendance et redistribution.
+
+    Logique de fiabilité par output (spec §4.3) :
+      - volume_7d ≥ min_vol_7d + median_7d → "high" (avec détection tendance si avg disponibles)
+      - volume_30d ≥ 15 + median_30d       → "medium"
+      - sell_price spot disponible          → "low"
+      - aucune donnée                       → exclu, probabilité redistribuée aux autres outputs
     """
     if len(inputs) != 10:
         raise ValueError(f"Un trade-up requiert exactement 10 inputs, reçu {len(inputs)}")
@@ -81,42 +154,59 @@ def calculate_ev(
     for inp in inputs:
         collection_counts[inp.collection_id] = collection_counts.get(inp.collection_id, 0) + 1
 
-    # ÉTAPE 2 — Détermination des prix de vente réels et filtrage des outputs
-    processed_outputs: list[tuple[OutputSkin, float, str]] = []  # (skin, prob_initiale, reliability)
-    
+    # ÉTAPE 2 — Détermination des prix de vente, détection tendance et redistribution
+    processed_outputs: list[tuple[OutputSkin, float, str]] = []  # (skin, prob, reliability)
+
     for coll_id, count in collection_counts.items():
         coll_outputs = outputs_by_collection.get(coll_id, [])
         if not coll_outputs:
             continue
-            
+
         coll_prob_weight = count / 10.0
-        
-        # Évaluer la fiabilité et le prix de chaque output de cette collection
+
+        # Évaluer fiabilité et prix ajusté de chaque output (avec fallback + tendance)
         valid_coll_outputs = []
         for out in coll_outputs:
             price = None
             reliability = "insufficient"
-            
+
             if out.volume_7d and out.volume_7d >= min_vol_7d and out.median_7d:
-                price = out.median_7d
-                reliability = "high"
+                base = out.median_7d
+                # Règles 2-3 — Détection de tendance (seulement fenêtre 7j)
+                if out.avg_7d and out.avg_30d and out.avg_30d > 0:
+                    trend = (out.avg_7d - out.avg_30d) / out.avg_30d
+                    if trend < -0.15:
+                        price = base * (1 + trend * 0.5)
+                        reliability = "trending_down"
+                    elif trend > 0.15:
+                        price = base
+                        reliability = "trending_up"
+                    else:
+                        price = base
+                        reliability = "stable"
+                else:
+                    price = base
+                    reliability = "stable"
             elif out.volume_30d and out.volume_30d >= 15 and out.median_30d:
                 price = out.median_30d
                 reliability = "medium"
             elif out.sell_price and out.sell_price > 0:
                 price = out.sell_price
                 reliability = "low"
-            
-            if price is not None:
-                valid_coll_outputs.append((out, price, reliability))
-        
+
+            if price is None:
+                continue  # exclu — sa probabilité est redistribuée
+            if exclude_trending_down and reliability == "trending_down":
+                continue
+
+            valid_coll_outputs.append((out, price, reliability))
+
         if not valid_coll_outputs:
             continue
-            
+
         # Redistribution des probabilités au sein de la collection
         prob_per_output = coll_prob_weight / len(valid_coll_outputs)
         for out_obj, price, rel in valid_coll_outputs:
-            # On stocke le prix calculé dans l'objet pour l'EV brute
             out_obj.sell_price = price
             processed_outputs.append((out_obj, prob_per_output, rel))
 
@@ -124,9 +214,15 @@ def calculate_ev(
         raise ValueError("Aucun output valide après filtrage de fiabilité")
 
     # Fiabilité globale = le pire cas parmi les outputs
-    reliability_ranks = {"high": 3, "medium": 2, "low": 1}
-    min_rank = min(reliability_ranks[rel] for _, _, rel in processed_outputs)
-    overall_reliability = [k for k, v in reliability_ranks.items() if v == min_rank][0]
+    def _rel_rank(rel: str) -> int:
+        if rel in ("stable", "trending_up") or rel.endswith("_price_divergence"):
+            return 3
+        if rel in ("medium", "trending_down"):
+            return 2
+        return 1  # "low"
+
+    min_rank = min(_rel_rank(rel) for _, _, rel in processed_outputs)
+    overall_reliability = {3: "high", 2: "medium", 1: "low"}[min_rank]
 
     pool_size = len(processed_outputs)
 
