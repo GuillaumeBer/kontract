@@ -61,7 +61,10 @@ def build_collections_db() -> dict:
     # Index des skins détaillés par id
     skins_idx: dict[str, dict] = {s["id"]: s for s in skins_list}
 
-    stats = {"collections": 0, "skins": 0, "tradeup_links": 0}
+    stats = {"collections": 0, "skins": 0, "tradeup_links": 0, "tradeup_links_removed": 0}
+
+    # Ensemble des triplets (input, output, collection) valides selon ByMykel
+    valid_triplets: set[tuple[str, str, str]] = set()
 
     with get_session() as session:
         for collection in collections:
@@ -97,6 +100,7 @@ def build_collections_db() -> dict:
                 # Construction du pool d'outputs
                 outputs = get_output_pool(collection, skin_ref["rarity"]["id"])
                 for output in outputs:
+                    valid_triplets.add((skin_ref["id"], output["id"], collection["id"]))
                     # Upsert via INSERT OR IGNORE (SQLite)
                     stmt = sqlite_insert(TradeupPool).values(
                         input_skin_id=skin_ref["id"],
@@ -106,11 +110,28 @@ def build_collections_db() -> dict:
                     session.execute(stmt)
                     stats["tradeup_links"] += 1
 
+        # Supprimer les liens TradeupPool obsolètes (absents des données ByMykel actuelles)
+        stale_pools = [
+            row for row in session.query(TradeupPool).all()
+            if (row.input_skin_id, row.output_skin_id, row.collection_id) not in valid_triplets
+        ]
+        for row in stale_pools:
+            session.delete(row)
+        stats["tradeup_links_removed"] = len(stale_pools)
+        if stale_pools:
+            logger.info("TradeupPool : %d liens obsolètes supprimés", len(stale_pools))
+
+        # Marquer les collections absentes de ByMykel comme inactives
+        current_collection_ids = {c["id"] for c in collections}
+        session.query(Collection).filter(
+            Collection.id.notin_(current_collection_ids)
+        ).update({"active": False}, synchronize_session=False)
+
         session.commit()
 
     logger.info(
-        "BDD mise à jour : %d collections, %d skins, %d liens trade-up",
-        stats["collections"], stats["skins"], stats["tradeup_links"],
+        "BDD mise à jour : %d collections, %d skins, %d liens trade-up (%d supprimés)",
+        stats["collections"], stats["skins"], stats["tradeup_links"], stats["tradeup_links_removed"],
     )
     return stats
 
