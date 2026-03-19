@@ -63,8 +63,10 @@ class Price(Base):
     volume_24h = Column(Float, nullable=True)
     volume_7d  = Column(Float, nullable=True)
     volume_30d = Column(Float, nullable=True)
-    avg_7d     = Column(Float, nullable=True)   # prix moyen sur 7 jours (détection tendance)
-    avg_30d    = Column(Float, nullable=True)   # prix moyen sur 30 jours (détection tendance)
+    median_7d  = Column(Float, nullable=True)   # médiane sur 7 jours (base prix — Règle 1)
+    median_30d = Column(Float, nullable=True)   # médiane sur 30 jours (base prix — Règle 1)
+    avg_7d     = Column(Float, nullable=True)   # moyenne sur 7 jours (détection tendance — Règle 2)
+    avg_30d    = Column(Float, nullable=True)   # moyenne sur 30 jours (détection tendance — Règle 2)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     skin = relationship("Skin", back_populates="prices")
@@ -98,4 +100,5 @@ class Opportunity(Base):
     roi = Column(Float, nullable=False)
     pool_size = Column(Integer, nullable=False)
     liquidity_score = Column(Float, nullable=True)
+    price_reliability = Column(String, nullable=True)  # "high" | "medium" | "low"
     created_at = Column(DateTime, default=datetime.utcnow)

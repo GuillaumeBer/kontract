@@ -125,11 +125,19 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
 
             new_buy = sp_item.get("min_price")
             new_sell = sp_item.get("suggested_price") or sp_item.get("median_price")
+            
+            # Extract historical data
+            last_24h = sp_hist_item.get("last_24_hours", {}) or {}
+            last_7d = sp_hist_item.get("last_7_days", {}) or {}
+            last_30d = sp_hist_item.get("last_30_days", {}) or {}
+
             volume_24h = last_24h.get("volume")
-            volume_7d  = (sp_hist_item.get("last_7_days")  or {}).get("volume")
-            volume_30d = (sp_hist_item.get("last_30_days") or {}).get("volume")
-            avg_7d     = (sp_hist_item.get("last_7_days")  or {}).get("avg")
-            avg_30d    = (sp_hist_item.get("last_30_days") or {}).get("avg")
+            volume_7d  = last_7d.get("volume")
+            volume_30d = last_30d.get("volume")
+            median_7d  = last_7d.get("median")
+            median_30d = last_30d.get("median")
+            avg_7d     = last_7d.get("avg")
+            avg_30d    = last_30d.get("avg")
 
             # Vérifier variation vs prix en cache
             existing = session.query(Price).filter_by(
@@ -150,6 +158,8 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
                 volume_24h=volume_24h,
                 volume_7d=volume_7d,
                 volume_30d=volume_30d,
+                median_7d=median_7d,
+                median_30d=median_30d,
                 avg_7d=avg_7d,
                 avg_30d=avg_30d,
                 updated_at=datetime.now(timezone.utc),
@@ -161,6 +171,8 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
                     volume_24h=volume_24h,
                     volume_7d=volume_7d,
                     volume_30d=volume_30d,
+                    median_7d=median_7d,
+                    median_30d=median_30d,
                     avg_7d=avg_7d,
                     avg_30d=avg_30d,
                     updated_at=datetime.now(timezone.utc),

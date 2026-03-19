@@ -17,13 +17,17 @@ logger = logging.getLogger(__name__)
 def _format_opportunity_message(opp: dict) -> str:
     """Formate un message Telegram Markdown pour une opportunité."""
     outputs_text = "\n".join(
-        f"  • {o['name']}: {o['prob']:.1f}% → {o['sell_price']:.2f}€"
+        f"  • {o['name']}: {o['prob']:.1f}% → {o['sell_price']:.2f}€ ({o.get('reliability', 'low')})"
         for o in opp.get("outputs", [])[:5]
     )
+    rel = opp.get("price_reliability", "low").upper()
+    rel_emoji = "🟢" if rel == "HIGH" else "🟡" if rel == "MEDIUM" else "🔴"
+    
     return (
         f"🎯 *Trade-up Profitable Détecté !*\n\n"
         f"*Input* : {opp['input_name']}\n"
         f"*ROI* : {opp['roi']:.1f}%\n"
+        f"*Fiabilité Prix* : {rel_emoji} {rel}\n"
         f"*EV nette* : {opp['ev_nette']:.2f}€\n"
         f"*Coût 10x* : {opp['cout_ajuste']:.2f}€\n"
         f"*Pool size* : {opp['pool_size']} outcomes\n"
