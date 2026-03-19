@@ -171,6 +171,9 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "pool_score": result.pool_score,
                     "liquidity_score": result.liquidity_score,
                     "win_prob": result.win_prob,
+                    "jackpot_ratio": result.jackpot_ratio,
+                    "ev_ajustee": result.ev_ajustee,
+                    "kontract_score": result.kontract_score,
                     "outputs": result.outputs,
                 })
 

@@ -10,6 +10,7 @@ Formule EV en 5 étapes (spec §4.3) :
   5. ROI + métriques scoring
 """
 
+import math
 from dataclasses import dataclass, field
 
 # Frais par plateforme
@@ -48,6 +49,9 @@ class EVResult:
     pool_score: float          # 1 / nb_outputs_total (haut = pool concentré)
     liquidity_score: float     # volume_24h de l'output le plus liquide
     win_prob: float            # prob de tomber sur un output > coût ajusté
+    jackpot_ratio: float       # max_price / mean_price — 1.0 = outputs uniformes, >> 1 = jackpot
+    ev_ajustee: float          # ev_nette × (win_prob / 100) — gain net pondéré par probabilité
+    kontract_score: float      # score composite risk-adjusted (Sharpe-like + bonus liquidité)
     outputs: list[dict] = field(default_factory=list)
 
 
@@ -122,6 +126,20 @@ def calculate_ev(
         if out.sell_price * (1 - fee_sell) > cout_ajuste
     )
 
+    # Jackpot ratio — mesure la concentration du risque sur un seul output
+    prices = [out.sell_price for out, _ in output_probs]
+    max_price = max(prices)
+    mean_price = sum(prices) / len(prices)
+    jackpot_ratio = max_price / mean_price if mean_price > 0 else 1.0
+
+    # EV ajustée par la probabilité de gagner
+    ev_ajustee = ev_nette * (win_prob / 100)
+
+    # Score de risque ajusté (Sharpe-like) + bonus liquidité logarithmique
+    score_risque = ev_ajustee / math.sqrt(max(jackpot_ratio, 1.0))
+    bonus_liquidite = math.log1p(liquidity_score)
+    kontract_score = score_risque * (1 + bonus_liquidite)
+
     outputs_detail = [
         {
             "skin_id": out.skin_id,
@@ -142,6 +160,9 @@ def calculate_ev(
         pool_score=round(pool_score, 4),
         liquidity_score=round(liquidity_score, 2),
         win_prob=round(win_prob * 100, 2),
+        jackpot_ratio=round(jackpot_ratio, 2),
+        ev_ajustee=round(ev_ajustee, 4),
+        kontract_score=round(kontract_score, 4),
         outputs=outputs_detail,
     )
 
