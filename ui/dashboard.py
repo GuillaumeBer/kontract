@@ -174,19 +174,37 @@ else:
         .applymap(color_roi, subset=["ROI (%)"])
         .applymap(color_win, subset=["Win prob (%)"])
     )
-    st.dataframe(styled, use_container_width=True, height=400)
+
+    # Sélection interactive par ligne
+    event = st.dataframe(
+        styled,
+        use_container_width=True,
+        height=400,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="opps_dataframe"
+    )
 
     # ─── Vue détail ────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("🔎 Détail d'une opportunité")
 
-    selected_name = st.selectbox(
-        "Sélectionner un skin input",
-        options=[o["input_name"] for o in opps],
-        index=0,
-    )
+    # Liste des hashes/noms basés sur le tri actuel du DataFrame
+    current_hashes = df["_combo_hash"].tolist()
+    current_names = df["Input skin"].tolist()
 
-    selected = next((o for o in opps if o["input_name"] == selected_name), None)
+    # Initialisation de la sélection dans session_state
+    if "selected_hash" not in st.session_state or scan_btn:
+        st.session_state["selected_hash"] = current_hashes[0] if current_hashes else None
+
+    # Sync Table -> Session State
+    if event.selection.rows:
+        sel_idx = event.selection.rows[0]
+        st.session_state["selected_hash"] = current_hashes[sel_idx]
+
+    # Récupérer l'opportunité sélectionnée
+    selected = next((o for o in opps if o["combo_hash"] == st.session_state["selected_hash"]), None)
+
     if selected:
         d1, d2 = st.columns(2)
 
