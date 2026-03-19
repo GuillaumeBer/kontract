@@ -145,10 +145,14 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
             ).first()
 
             if existing and existing.sell_price and new_sell:
-                variation = abs(new_sell - existing.sell_price) / existing.sell_price
-                if variation < threshold:
-                    stats["skipped"] += 1
-                    continue
+                # Force update if historical columns are still NULL (new columns migration)
+                if existing.median_7d is None or existing.volume_30d is None:
+                    pass 
+                else:
+                    variation = abs(new_sell - existing.sell_price) / existing.sell_price
+                    if variation < threshold:
+                        stats["skipped"] += 1
+                        continue
 
             stmt = sqlite_insert(Price).values(
                 skin_id=skin.id,
