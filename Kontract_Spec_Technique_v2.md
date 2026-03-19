@@ -444,6 +444,105 @@ Le champ `reliability` remonte dans le dashboard et dans l'alerte Telegram. Une 
 
 ---
 
+#### Float-conditional EV — prix spécifique à la condition de wear
+
+La recherche communautaire confirme que c'est l'alpha n°1 ignoré par tous les outils. L'output float est déterministe — on peut donc calculer la condition de wear exacte de l'output, et utiliser le prix **spécifique à cette condition** plutôt qu'un prix médian générique.
+
+```python
+def get_output_wear(avg_norm: float, output_skin: dict) -> str:
+    """Détermine la condition de wear de l'output à partir du float calculé."""
+    f = output_skin["float_min"] + avg_norm * (output_skin["float_max"] - output_skin["float_min"])
+
+    if f < 0.07:   return "Factory New"
+    if f < 0.15:   return "Minimal Wear"
+    if f < 0.38:   return "Field-Tested"
+    if f < 0.45:   return "Well-Worn"
+    return "Battle-Scarred"
+
+def get_float_conditional_price(output_skin: dict, avg_norm: float, skinport_data: dict) -> float:
+    """
+    Retourne le prix Skinport correspondant à la condition de wear prédite.
+    Utilise le market_hash_name avec la condition correcte.
+    Exemple : "AWP | Asiimov (Field-Tested)" vs "AWP | Asiimov (Factory New)"
+    """
+    wear = get_output_wear(avg_norm, output_skin)
+    hash_name = f"{output_skin['name']} ({wear})"
+    skin_data = skinport_data.get(hash_name)
+    return skin_data["median_price"] if skin_data else None
+```
+
+L'EV devient ainsi **float-conditional** : pour chaque combinaison d'inputs, on calcule le float de l'output, on détermine sa condition, et on utilise le prix de cette condition. Pour un M4A1-S Player Two où FN vaut 80€ et FT vaut 30€, la différence est massive.
+
+> Float-conditional EV hors scope MVP — intégré en V2 avec les données float min/max de ByMykel.
+
+---
+
+#### Risque du trade hold 7 jours — ajustement de l'EV
+
+La recherche confirme ce risque sous-estimé. Les achats Steam Market sont bloqués 7 jours, et la Trade Protection de juillet 2025 ajoute 7 jours sur les items reçus en P2P.
+
+```python
+def apply_hold_discount(ev_nette: float, cout_ajuste: float,
+                        hold_days: int = 7,
+                        vol_history: dict = None) -> float:
+    """
+    Ajuste l'EV nette pour tenir compte du coût d'opportunité du trade hold.
+    Approche simple : discount sur le capital immobilisé.
+    Approche avancée : discount basé sur la volatilité historique.
+    """
+    # Simple : taux d'opportunité quotidien × jours de hold
+    taux_quotidien = 0.005  # 0.5%/jour
+    discount_simple = cout_ajuste * taux_quotidien * hold_days
+
+    # Avancé : si on a l'historique de prix sur la période
+    if vol_history:
+        vol_30d = vol_history.get("price_std_30d", 0)  # écart-type des prix 30j
+        risk_premium = cout_ajuste * (vol_30d / 100) * (hold_days / 30)
+        discount = max(discount_simple, risk_premium)
+    else:
+        discount = discount_simple
+
+    return ev_nette - discount
+
+# Pour Skinport (achat direct) : hold_days = 7
+# Pour achat P2P + trade : hold_days = 14 (Trade Protection juillet 2025)
+```
+
+---
+
+#### Méthode de prix SteamAnalyst — blend temporel pondéré
+
+La recherche identifie SteamAnalyst comme gold standard avec 12 ans de données. Leur approche de blend temporel est plus robuste que notre fenêtre adaptative actuelle pour les skins à volume moyen :
+
+```python
+def get_price_steamanalyst_method(history: dict) -> float:
+    """
+    Blend temporel pondéré — inspiré de SteamAnalyst.
+    Plus robuste que la fenêtre adaptative sur les skins à volume moyen (10-99 ventes/j).
+    """
+    avg_7d  = history["last_7_days"]["avg"]   or 0
+    avg_30d = history["last_30_days"]["avg"]  or 0
+    avg_60d = history.get("last_60_days", {}).get("avg", avg_30d)  # si disponible
+    avg_90d = history["last_90_days"]["avg"]  or avg_30d
+
+    if not avg_7d:
+        return None
+
+    prix_blend = (avg_7d * 0.60) + (avg_30d * 0.25) + (avg_60d * 0.10) + (avg_90d * 0.05)
+
+    # Filtrage outliers 3-sigma
+    mean = avg_30d
+    std  = abs(avg_7d - avg_30d)  # approximation de l'écart-type
+    if abs(prix_blend - mean) > 3 * std:
+        return avg_30d  # fallback sur la moyenne 30j si outlier détecté
+
+    return prix_blend
+```
+
+> Ce blend est utilisé en complément de `get_sell_price()` pour les skins à volume moyen (10–99 ventes/jour). Pour les skins très liquides (100+ ventes/jour), la médiane 7j reste plus précise.
+
+---
+
 #### Sources de prix par phase
 
 | Phase | Source principale | Source secondaire | Référence haute valeur |
@@ -578,7 +677,9 @@ prob(output_cible) = 0.7 × (1 / nb_outputs_tier_sup_cible)
 cout_total         = 7 × prix_input_cible + 3 × prix_filler
 ```
 
-Les collections classiquement utilisées comme fillers (Italy, Lake, Safehouse, Train) ont des skins de bas tier peu coûteux et des outputs de tier supérieur peu désirables — leur ajout "pollue" peu l'EV globale.
+Les collections classiquement utilisées comme fillers (Italy, Lake, Safehouse, Train) ont des skins de bas tier peu coûteux et des outputs de tier supérieur peu désirables.
+
+> **Critère de sélection des fillers post-octobre 2025 :** la mise à jour a fondamentalement changé ce qui fait un bon filler. Avant, on cherchait des collections avec peu d'outcomes au tier supérieur (pour diluer le moins possible). Maintenant, le critère principal est le **float range le plus large possible (idéal : 0–1)**, car la normalisation universelle rend l'ancien avantage des float caps restreints contre-productif. Un filler avec float range 0–1 a toujours un impact neutre sur le float output. Les fillers actuellement populaires post-update : SG 553 Cyberforce (Kilowatt), Dual Berettas Hideout, MP5-SD Focus (Genesis).
 
 Le scanner choisit la stratégie qui **maximise le ROI final**, pas nécessairement celle qui minimise le coût brut.
 
@@ -901,33 +1002,43 @@ Le Kontract Score est un indicateur composite de 0 à +∞ (sans borne supérieu
 #### Formule de base (implémentée)
 
 ```python
-# ÉTAPE 1 : EV ajustée — pondérée par la probabilité de gagner
-ev_ajustee = ev_nette × win_prob
-# win_prob = Σ prob_i pour les outputs où prix_i × (1 - frais_vente) > cout_ajuste
-# ⚠️ Comparaison sur prix NET après frais, pas sur prix brut
+# ── NOTE ARCHITECTURALE : suppression du double-comptage win_prob × EV ──────
+# L'ancienne formule `ev_ajustee = ev_nette × win_prob` crée un double-comptage :
+# l'EV intègre DÉJÀ implicitement les probabilités (c'est une somme Σ prob_i × prix_i).
+# Multiplier ensuite par win_prob surpondère les trades à haute probabilité même si
+# leur EV nette est faible, et pénalise injustement les pools légitimement asymétriques.
+# → Remplacement par un analogue Sharpe ratio : EV_nette / CV_pondéré
 
-# ÉTAPE 2 : Variance pondérée — mesure l'asymétrie réelle du pool
-# Remplace jackpot_ratio = max/mean (non pondéré) par le coefficient de variation
-# pondéré par les probabilités de chaque output
+# ÉTAPE 1 : Variance pondérée — mesure l'asymétrie réelle du pool
 mean_pond = Σ (prob_i × prix_i)                          # espérance des prix
 var_pond  = Σ (prob_i × (prix_i - mean_pond)²)            # variance pondérée
 cv_pond   = sqrt(var_pond) / mean_pond if mean_pond else 1 # coeff. de variation
 
-# Pourquoi CV pondéré plutôt que jackpot_ratio ?
-# jackpot_ratio = max/mean : un output à 500€ (prob 2%) avec neuf à 10€ (prob 98%)
-#   → jackpot_ratio = 500/54 ≈ 9.3 → forte pénalité injustifiée (l'EV est dominée par les 10€)
-# cv_pond : pondère chaque output par sa probabilité réelle
-#   → pénalise correctement les pools réellement asymétriques
+# CV pondéré vs jackpot_ratio : un output à 500€ (prob 2%) + neuf à 10€ (prob 98%)
+# jackpot_ratio = 500/54 ≈ 9.3  → pénalité injustifiée (EV dominée par les 10€)
+# cv_pond ≈ 0.7                 → pénalité proportionnelle à la variance réelle ✓
 
-# ÉTAPE 3 : Score risque — EV corrigée de la dispersion pondérée
-score_risque = ev_ajustee / sqrt(max(cv_pond, 0.01))
+# ÉTAPE 2 : Score risque — analogue Sharpe (EV / dispersion)
+# win_prob reste calculé pour l'affichage et le dashboard, mais n'entre plus
+# dans le score pour éviter le double-comptage
+win_prob     = Σ prob_i où prix_i × (1 - frais_vente) > cout_ajuste  # affichage uniquement
+floor_value  = min(prix_i for i in outputs) × (1 - frais_vente)      # pire outcome net
+floor_ratio  = floor_value / cout_ajuste                               # % récupéré au pire cas
+score_risque = ev_nette / sqrt(max(cv_pond, 0.01))
 
-# ÉTAPE 4 : Bonus liquidité output — pondéré par probabilité (corrigé)
+# ÉTAPE 3 : Bonus liquidité output — pondéré par probabilité
 liquidity_score_output = sum(prob_i × volume_7d_i for i in outputs) / 7
 bonus_liquidite_output = ln(1 + liquidity_score_output)
 
+# ÉTAPE 4 : Discount trade hold (risque de dépréciation pendant 7–14 jours)
+# taux_opportunité = 0.5% par jour (approximation conservatrice du coût d'opportunité)
+# nb_jours_hold = 7 (Steam Market) ou 14 (achat P2P + trade protection juillet 2025)
+taux_opp_quotidien = 0.005
+nb_jours_hold      = opportunity.get("hold_days", 7)
+hold_discount      = 1 - (taux_opp_quotidien * nb_jours_hold)  # ex: 0.965 pour 7j
+
 # ÉTAPE 5 : Score final de base
-kontract_score_base = score_risque × (1 + bonus_liquidite_output)
+kontract_score_base = score_risque * (1 + bonus_liquidite_output) * hold_discount
 ```
 
 ---
@@ -978,8 +1089,13 @@ input_speed_bonus  = ln(1 + vol_24h_inputs_min)
 ```python
 def calculate_kontract_score(opportunity: dict) -> float:
     """
-    Kontract Score v2 — intègre liquidité inputs/outputs, CV pondéré,
-    détection haute volatilité, et win_prob sur prix nets.
+    Kontract Score v3 — intègre:
+    - Sharpe ratio (EV/CV) au lieu du double-comptage win_prob × EV
+    - Liquidité inputs/outputs pondérée par probabilité
+    - Discount trade hold 7j
+    - Pénalité haute volatilité
+    - Floor ratio (pire outcome / coût)
+    - Recipe velocity detection
     Pas de borne supérieure théorique. Tri par ordre décroissant.
     """
     from math import sqrt, log
@@ -990,29 +1106,38 @@ def calculate_kontract_score(opportunity: dict) -> float:
     frais_vente            = opportunity["frais_vente"]
     input_liquidity_status = opportunity["input_liquidity_status"]
     vol_24h_inputs         = opportunity["vol_24h_inputs"]
+    hold_days              = opportunity.get("hold_days", 7)
+    input_price_trend      = opportunity.get("input_price_trend_7d", 0.0)  # recipe velocity
 
     prix_outputs = [o["prix"] for o in outputs]
 
-    # ── win_prob sur prix NET (corrigé) ─────────────────────────────
+    # ── win_prob — AFFICHAGE UNIQUEMENT (ne rentre plus dans le score) ─
     win_prob = sum(
         o["prob"] for o in outputs
         if o["prix"] * (1 - frais_vente) > cout_ajuste
     )
 
-    # ── EV ajustée ──────────────────────────────────────────────────
-    ev_ajustee = ev_nette * win_prob
-
-    # ── CV pondéré (remplace jackpot_ratio) ─────────────────────────
+    # ── CV pondéré (analogue Sharpe) ────────────────────────────────────
     mean_pond = sum(o["prob"] * o["prix"] for o in outputs)
     var_pond  = sum(o["prob"] * (o["prix"] - mean_pond) ** 2 for o in outputs)
     cv_pond   = sqrt(var_pond) / mean_pond if mean_pond > 0 else 1
-    score_risque = ev_ajustee / sqrt(max(cv_pond, 0.01))
+    score_risque = ev_nette / sqrt(max(cv_pond, 0.01))
 
-    # ── Liquidité output pondérée par probabilité (corrigée) ─────────
+    # ── Floor ratio — protection contre le pire cas ──────────────────────
+    floor_value = min(o["prix"] for o in outputs) * (1 - frais_vente)
+    floor_ratio = floor_value / cout_ajuste if cout_ajuste > 0 else 0
+    # floor_ratio < 0.20 → peut perdre > 80% → pénalité supplémentaire
+    floor_factor = 1.0 if floor_ratio >= 0.20 else (0.5 + floor_ratio * 2.5)
+
+    # ── Liquidité output pondérée par probabilité ────────────────────────
     liq_out = sum(o["prob"] * o["vol_7d"] for o in outputs) / 7
     bonus_liq_out = log(1 + liq_out)
 
-    # ── Inputs — exécutabilité et vitesse ───────────────────────────
+    # ── Trade hold discount ──────────────────────────────────────────────
+    taux_opp_quotidien = 0.005   # 0.5%/jour coût d'opportunité
+    hold_discount = max(0.5, 1 - taux_opp_quotidien * hold_days)
+
+    # ── Inputs — exécutabilité et vitesse ───────────────────────────────
     input_exec_factor = {
         "liquid":  1.00,
         "partial": 0.75,
@@ -1022,23 +1147,38 @@ def calculate_kontract_score(opportunity: dict) -> float:
     vol_24h_min       = min(vol_24h_inputs)
     input_speed_bonus = log(1 + vol_24h_min)
 
-    # ── Pénalité haute volatilité ────────────────────────────────────
-    # Si au moins un output est marqué high_volatility (variation 24h > 15%)
-    # → signal de marché perturbé, réduction du score de 30%
+    # ── Recipe velocity — pénalité si inputs déjà en hausse ─────────────
+    # Si les inputs ont monté de >10% sur 7j, le trade-up est probablement
+    # déjà connu — la fenêtre de profit se referme
+    if input_price_trend > 0.10:
+        velocity_penalty = max(0.5, 1 - input_price_trend)
+    else:
+        velocity_penalty = 1.0
+
+    # ── Pénalité haute volatilité ────────────────────────────────────────
     volatility_factor = 0.70 if any(
         "high_volatility" in o.get("reliability", "") for o in outputs
     ) else 1.00
 
-    # ── Score final ─────────────────────────────────────────────────
+    # ── Score final ──────────────────────────────────────────────────────
     kontract_score = (
         score_risque
-        * input_exec_factor
+        * floor_factor
         * (1 + bonus_liq_out)
+        * hold_discount
+        * input_exec_factor
         * (1 + 0.15 * input_speed_bonus)
+        * velocity_penalty
         * volatility_factor
     )
 
-    return round(kontract_score, 2)
+    return round(kontract_score, 2), {
+        "win_prob":       round(win_prob, 3),    # affiché dans l'UI
+        "floor_ratio":    round(floor_ratio, 3), # affiché dans l'UI
+        "cv_pond":        round(cv_pond, 3),
+        "hold_days":      hold_days,
+        "velocity_alert": input_price_trend > 0.10,
+    }
 ```
 
 ---
@@ -1079,18 +1219,22 @@ Malgré un ROI presque deux fois supérieur, l'opportunité B obtient un Kontrac
 
 ---
 
-#### Tableau récapitulatif des évolutions vs formule de base
+#### Tableau récapitulatif des évolutions — recherche communautaire
 
-| # | Élément | Avant | Après | Criticité |
-|---|---------|-------|-------|-----------|
-| 1 | Direction des frais acheteur | `× (1 - frais)` | `× (1 + frais)` | 🔴 Corrigé |
-| 2 | Skins fantômes dans le pool | Non protégé | `volume_30d=0` → `insufficient_data` | 🔴 Corrigé |
-| 3 | `win_prob` | Prix brut | Prix net `× (1 - frais_vente)` | 🔴 Corrigé |
-| 4 | Anomalie `min_price` input | Non détectée | `is_price_anomaly()` → fallback médiane | 🟠 Ajouté |
-| 5 | Haute volatilité 24h | Non détectée | Flag + pénalité `× 0.70` sur le score | 🟠 Ajouté |
-| 6 | Mesure asymétrie pool | `jackpot_ratio = max/mean` | `cv_pond` pondéré par probabilité | 🟠 Remplacé |
-| 7 | Frais plateformes | Commentaires éparses | `FEES` dict centralisé et versionné | 🟡 Ajouté |
-| 8 | Schéma BDD | Incomplet | Tous les champs du calcul enrichi | 🟡 Mis à jour |
+| # | Problème identifié | Source | Avant | Après |
+|---|---|---|---|---|
+| 1 | Double-comptage win_prob × EV | Analyse communautaire | `ev_nette × win_prob / cv` | `ev_nette / cv` (Sharpe ratio) — win_prob affiché uniquement |
+| 2 | Floor value absent | Communauté (piège perte totale) | Absent | `floor_ratio = min_output_net / cout` → facteur multiplicateur |
+| 3 | Trade hold 7j non modélisé | CSDelta, communauté | Absent | Discount `1 - 0.5%/jour × nb_jours` |
+| 4 | Recipe velocity | TradeUpSpy reviews | Absent | Pénalité si inputs +10% en 7j |
+| 5 | Direction frais acheteur | Revue interne | `× (1 - frais)` | `× (1 + frais)` |
+| 6 | win_prob sur prix bruts | Revue interne | Prix brut | Prix net `× (1 - frais_vente)` |
+| 7 | CV pondéré vs jackpot_ratio | Revue interne | `max/mean` | `sqrt(var_pond) / mean_pond` |
+| 8 | Liquidité output max → pondérée | Revue interne | `max(vol_7d)` | `Σ(prob × vol_7d)` |
+| 9 | Exécutabilité inputs absente | Revue interne | Absent | `× input_exec_factor` |
+| 10 | Anomalie min_price | Revue interne | Non détectée | `is_price_anomaly()` |
+| 11 | Haute volatilité 24h | Revue interne | Non détectée | Flag + `× 0.70` |
+| 12 | Frais centralisés | Revue interne | Commentaires éparses | Dict `FEES` versionné |
 
 ---
 
@@ -1110,9 +1254,178 @@ Dans l'alerte Telegram :
 ```
 🎯 Kontract Score : 24.7
 AK-47 Redline FT → AWP Fever Dream FN
-ROI : +18% | EV nette : +9.20€
-Pool : 3 outcomes | Inputs : 🟢 liquid (qty=40)
-Output liquidité : 40 ventes/7j | Prix : 🟢 stable
+ROI : +18% | EV nette : +9.20€ | win_prob : 85% | floor : 42%
+Pool : 3 outcomes | Inputs : 🟢 liquid (qty=40) | Kelly : 2.3% du bankroll
+Output liquidité : 40 ventes/7j | Prix : 🟢 stable | Répétable 8×
+```
+
+---
+
+### 4.7 Module 3 — Détections avancées et métriques complémentaires
+
+#### Recipe velocity — détection de trade-up viral
+
+Dès qu'un trade-up profitable devient connu, les prix des inputs bondissent de 10–20% en quelques heures et la marge disparaît. Kontract.gg détecte ce signal et alerte avant saturation.
+
+```python
+def detect_recipe_velocity(input_skins: list, skinport_history: dict) -> dict:
+    """Détecte si les inputs d'un trade-up sont déjà en hausse rapide."""
+    trends = []
+    for skin in input_skins:
+        h = skinport_history.get(skin["market_hash_name"], {})
+        avg_24h = h.get("last_24_hours", {}).get("avg", 0)
+        avg_7d  = h.get("last_7_days", {}).get("avg", 0)
+        if avg_7d > 0:
+            trends.append((avg_24h - avg_7d) / avg_7d)
+
+    avg_trend = sum(trends) / len(trends) if trends else 0
+    max_trend = max(trends) if trends else 0
+
+    return {
+        "avg_input_trend_24h": avg_trend,
+        "max_input_trend_24h": max_trend,
+        "velocity_alert":      max_trend > 0.05,   # +5% en 24h = signal
+        "saturated":           avg_trend > 0.10,   # +10% moyen = fenêtre fermée
+    }
+```
+
+Le flag `velocity_alert` déclenche une alerte : "⚡ Les inputs de ce trade-up montent — fenêtre de profit en cours de fermeture."
+
+---
+
+#### Détection de manipulation de prix (pump groups)
+
+Des groupes coordonnés créent des pumps artificiels sur les skins à faible supply. L'AK-47 Safari Mesh a été multiplié par 20× en quelques semaines. Ces opportunités sont des pièges.
+
+```python
+def detect_pump(history: dict, items: dict) -> dict:
+    avg_7d   = history["last_7_days"]["avg"]   or 0
+    avg_30d  = history["last_30_days"]["avg"]  or 0
+    vol_7d   = history["last_7_days"]["volume"]  or 0
+    vol_30d  = history["last_30_days"]["volume"] or 0
+    quantity = items.get("quantity", 0)
+
+    hausse_7d_30d = (avg_7d - avg_30d) / avg_30d if avg_30d else 0
+
+    pump_score = 0
+    if hausse_7d_30d > 0.15:  pump_score += 2  # +15% en 7j
+    if quantity < 20:          pump_score += 1  # supply très faible
+    if vol_7d > vol_30d * 0.5: pump_score += 1  # volume concentré sur 7j
+
+    return {
+        "pump_score":  pump_score,        # 0=normal, 3-4=probable pump
+        "pump_alert":  pump_score >= 3,
+        "hausse_7d":   hausse_7d_30d,
+    }
+```
+
+---
+
+#### Scalability score — répétabilité du trade-up
+
+Un trade-up profitable à 1× n'a pas la même valeur qu'un trade-up profitable à 50×.
+
+```python
+def calculate_scalability(input_skins: list, skinport_items: dict) -> dict:
+    qty_per_run = 10
+    min_repeats = float("inf")
+    bottleneck  = None
+
+    for skin in input_skins:
+        qty = skinport_items.get(skin["id"], {}).get("quantity", 0)
+        runs = qty // qty_per_run
+        if runs < min_repeats:
+            min_repeats = runs
+            bottleneck  = skin["name"]
+
+    return {
+        "max_repeats":     min_repeats,
+        "bottleneck_skin": bottleneck,
+        "scalable_10x":    min_repeats >= 10,
+        "scalable_50x":    min_repeats >= 50,
+    }
+```
+
+Affiché : "Répétable 8× | Goulot : AK-47 Redline FT (qty=80)"
+
+---
+
+#### Doppler phases — pondération si output Doppler
+
+Si un trade-up peut produire un couteau Doppler, les phases ont des valeurs très différentes. L'EV doit pondérer par phase, pas utiliser un prix médian générique.
+
+```python
+DOPPLER_PHASE_WEIGHTS = {
+    "Phase 1": 0.225, "Phase 2": 0.225,
+    "Phase 3": 0.225, "Phase 4": 0.225,
+    "Ruby": 0.020, "Sapphire": 0.020,
+    "Black Pearl": 0.010, "Emerald": 0.050,
+}
+
+def get_doppler_ev(output_skin: dict, skinport_items: dict) -> float:
+    if "Doppler" not in output_skin.get("name", ""):
+        return None
+    ev = 0
+    for phase, w in DOPPLER_PHASE_WEIGHTS.items():
+        data = skinport_items.get(f"{output_skin['name']} ({phase})")
+        if data and data.get("median_price"):
+            ev += w * data["median_price"]
+    return ev or None
+```
+
+---
+
+#### Kelly Criterion — position sizing recommandé
+
+Absent de tous les outils concurrents. La communauté recommande le half-Kelly : le full Kelly a 1/3 de probabilité de diviser le bankroll par deux avant de le doubler. Règle absolue : jamais plus de 5% du bankroll sur un seul trade-up.
+
+```python
+def kelly_position_size(ev_nette: float, cout_ajuste: float,
+                        win_prob: float, bankroll: float) -> dict:
+    b = ev_nette / cout_ajuste  # ratio gain/mise
+    p, q = win_prob, 1 - win_prob
+
+    if b <= 0 or p <= 0:
+        return {"kelly_fraction": 0, "recommended_size": 0, "pct_bankroll": 0}
+
+    f_full  = (b * p - q) / b
+    f_half  = f_full / 2
+    safe    = min(f_half, 0.05)  # cap à 5% du bankroll
+
+    return {
+        "kelly_full":       round(f_full, 4),
+        "kelly_half":       round(f_half, 4),
+        "recommended_size": round(bankroll * safe, 2),
+        "pct_bankroll":     round(safe * 100, 1),
+    }
+```
+
+---
+
+#### StatTrak liquidity flag
+
+Les trade-ups StatTrak ont un marché structurellement moins liquide. Un output StatTrak illiquide peut rester invendu des semaines même avec une EV positive.
+
+```python
+def check_stattrak_liquidity(output_skin: dict, history: dict) -> str:
+    is_st  = "StatTrak" in output_skin.get("name", "")
+    vol_30d = history.get("last_30_days", {}).get("volume", 0)
+
+    if is_st and vol_30d < 10:  return "stattrak_illiquid"
+    if is_st and vol_30d < 30:  return "stattrak_low_liq"
+    if is_st:                   return "stattrak_ok"
+    return "normal"
+```
+
+---
+
+#### Avertissement systémique permanent — risque Valve
+
+Le risque Valve est existentiel et non modélisable. La MAJ octobre 2025 a effacé ~2 Mrd$ en 24h. Kontract.gg affiche un avertissement permanent visible dans le dashboard et dans chaque alerte :
+
+```
+⚠️ Risque systémique : toute mise à jour Valve peut invalider les opportunités en cours.
+   Les prix peuvent varier de ±30% en quelques heures sans préavis.
 ```
 
 ---
