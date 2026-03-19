@@ -56,7 +56,7 @@ def _opportunities_to_df(opps: list[dict]) -> pd.DataFrame:
             "Coût 10x (€)": round(opp["cout_ajuste"], 2),
             "Pool size": opp["pool_size"],
             "Jackpot ratio": round(opp.get("jackpot_ratio", 1.0), 1),
-            "Liquidité (vol/7j)": round(opp["liquidity_score"], 1),
+            "Liquidité": round(opp["liquidity_score"], 1),
             "_combo_hash": opp["combo_hash"],
             "_outputs": opp.get("outputs", []),
         })
@@ -75,11 +75,13 @@ with st.sidebar:
     max_budget = st.number_input("Budget max 10x inputs (€)", min_value=10.0, max_value=10000.0,
                                   value=200.0, step=10.0)
     max_pool = st.slider("Pool max (nb outcomes)", min_value=1, max_value=20, value=5)
-    min_liquidity = st.slider("Liquidité min (ventes/7j)", min_value=0.0, max_value=50.0,
+    min_liquidity = st.slider("Liquidité min (vol. relatif)", min_value=0.0, max_value=50.0,
                                value=0.0, step=1.0)
     
-    min_vol_7d = st.slider("Volume min prix vente (7j)", min_value=3, max_value=30, value=7,
-                           help="Nombre de ventes minimum sur 7 jours pour considérer le prix médian comme fiable.")
+    min_vol_sell = st.slider("Volume min prix vente (30j)", min_value=10, max_value=100, value=30,
+                           help="Nombre de ventes minimum pour considérer le prix médian comme statistiquement fiable.")
+
+    exclude_down = st.checkbox("Exclure tendances baissières (> 15%)", value=False)
 
     source_buy = st.selectbox("Source prix achat", ["skinport", "steam"], index=0)
     source_sell = st.selectbox("Source prix vente", ["skinport", "steam"], index=0)
@@ -104,7 +106,8 @@ if scan_btn or "opportunities" not in st.session_state:
         max_budget=max_budget,
         max_pool_size=max_pool,
         min_liquidity=min_liquidity,
-        min_price_vol_7d=min_vol_7d,
+        min_volume_sell_price=min_vol_sell,
+        exclude_trending_down=exclude_down,
         source_buy=source_buy,
         source_sell=source_sell,
     )
@@ -174,9 +177,9 @@ else:
         return ""
 
     def color_rel(val):
-        if val == "HIGH":
+        if "STABLE" in val or "TRENDING_UP" in val:
             return "color: #2d6a4f; font-weight: bold"
-        elif val == "MEDIUM":
+        elif "TRENDING_DOWN" in val:
             return "color: #d1a110; font-weight: bold"
         return "color: #b91c1c; font-weight: bold"
 
@@ -233,12 +236,12 @@ else:
             st.markdown(f"**Win probability** : {selected['win_prob']:.1f}%")
             
             rel = selected.get("price_reliability", "low").upper()
-            rel_color = "🟢" if rel == "HIGH" else "🟡" if rel == "MEDIUM" else "🔴"
+            rel_color = "🟢" if "STABLE" in rel or "UP" in rel else "🟡" if "DOWN" in rel else "🔴"
             st.markdown(f"**Fiabilité prix** : {rel_color} {rel}")
             
             st.markdown(f"**Pool size** : {selected['pool_size']} outcomes possibles")
-            st.markdown(f"**Jackpot ratio** : {selected.get('jackpot_ratio', 1):.1f}× *(1.0 = uniformes)*")
-            st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f} ventes/7j")
+            st.markdown(f"**Jackpot ratio** : {selected.get('jackpot_ratio', 1):.1f}×")
+            st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f}")
 
         with d2:
             outputs = selected.get("outputs", [])
@@ -249,8 +252,7 @@ else:
                         "Skin": o["name"],
                         "Prob (%)": o["prob"],
                         "Prix vente (€)": o["sell_price"],
-                        "Fiabilité": o.get("reliability", "low").upper(),
-                        "Vol 7j": o.get("volume_7d", 0),
+                        "État": o.get("reliability", "low").upper(),
                     }
                     for o in outputs
                 ])
