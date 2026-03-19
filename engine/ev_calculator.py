@@ -21,6 +21,67 @@ FEES = {
 
 
 @dataclass
+class SellPriceResult:
+    adjusted_price: float
+    reliability: str  # "stable" | "trending_down" | "trending_up" | "*_price_divergence"
+
+
+def get_sell_price(price_data: dict, steam_data: dict | None = None) -> "SellPriceResult | None":
+    """
+    Calcule le prix de vente ajusté selon 4 règles (spec §4.3).
+    Retourne None si données insuffisantes (< 30 ventes sur toutes les fenêtres).
+
+    Règle 1 — Fenêtre adaptative : médiane 7j si volume_7j ≥ 30, sinon médiane 30j, sinon exclu.
+    Règle 2 — Tendance : trend = (avg_7d - avg_30d) / avg_30d.
+    Règle 3 — Ajustement conservateur : pénalité 50% si baisse > 15%, inchangé si hausse.
+    Règle 4 — Cross-check Steam (V1+) : min(adjusted, steam_median) si divergence > 20%.
+    """
+    volume_7d  = price_data.get("volume_7d")  or 0
+    volume_30d = price_data.get("volume_30d") or 0
+    avg_7d     = price_data.get("avg_7d")
+    avg_30d    = price_data.get("avg_30d")
+
+    # Règle 1 — Fenêtre adaptative (seuil absolu : 30 ventes)
+    if volume_7d >= 30 and avg_7d:
+        base_price = avg_7d
+    elif volume_30d >= 30 and avg_30d:
+        base_price = avg_30d
+    else:
+        return None  # insufficient_data → exclu du scan
+
+    # Règle 2 — Détection de tendance
+    if avg_7d and avg_30d and avg_30d > 0:
+        trend = (avg_7d - avg_30d) / avg_30d
+    else:
+        trend = 0.0
+
+    # Règle 3 — Ajustement conservateur
+    if trend < -0.15:
+        # Pénalité partielle à 50% — on anticipe sans projeter linéairement
+        adjusted_price = base_price * (1 + trend * 0.5)
+        reliability = "trending_down"
+    elif trend > 0.15:
+        # Pas de surpondération haussière
+        adjusted_price = base_price
+        reliability = "trending_up"
+    else:
+        adjusted_price = base_price
+        reliability = "stable"
+
+    # Règle 4 — Cross-check multi-sources (V1+)
+    if steam_data and steam_data.get("median") and adjusted_price > 0:
+        divergence = abs(adjusted_price - steam_data["median"]) / adjusted_price
+        if divergence > 0.20:
+            adjusted_price = min(adjusted_price, steam_data["median"])
+            reliability += "_price_divergence"
+
+    return SellPriceResult(
+        adjusted_price=round(adjusted_price, 4),
+        reliability=reliability,
+    )
+
+
+@dataclass
 class InputSkin:
     skin_id: str
     name: str
@@ -34,9 +95,10 @@ class InputSkin:
 class OutputSkin:
     skin_id: str
     name: str
-    sell_price: float         # prix de vente attendu (hors frais)
+    sell_price: float         # prix de vente attendu ajusté (hors frais)
     volume_24h: float = 0.0   # nombre de ventes/jour (liquidité)
     source_sell: str = "skinport"
+    reliability: str = "stable"  # "stable" | "trending_down" | "trending_up" | "*_price_divergence"
 
 
 @dataclass

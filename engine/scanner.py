@@ -16,7 +16,7 @@ import numpy as np
 
 from data.database import get_session
 from data.models import Opportunity, Price, Skin, TradeupPool
-from engine.ev_calculator import InputSkin, OutputSkin, calculate_ev
+from engine.ev_calculator import InputSkin, OutputSkin, calculate_ev, get_sell_price
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ class UserFilters:
     max_budget: float = 100.0
     max_pool_size: int = 5
     min_liquidity: float = 3.0
+    min_volume_sell_price: int = 30        # ventes min pour fiabilité statistique (plage 10–100)
+    exclude_trending_down: bool = False    # exclure outputs en baisse > 15% sur 30 jours
     source_buy: str = "skinport"
     source_sell: str = "skinport"
 
@@ -36,9 +38,13 @@ def _get_platform_prices(session, platform: str) -> dict[str, dict]:
     rows = session.query(Price).filter_by(platform=platform).all()
     return {
         r.skin_id: {
-            "buy_price": r.buy_price,
+            "buy_price":  r.buy_price,
             "sell_price": r.sell_price,
             "volume_24h": r.volume_24h or 0.0,
+            "volume_7d":  r.volume_7d  or 0.0,
+            "volume_30d": r.volume_30d or 0.0,
+            "avg_7d":     r.avg_7d,
+            "avg_30d":    r.avg_30d,
         }
         for r in rows
         if r.buy_price or r.sell_price
@@ -109,19 +115,23 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                 if len(output_ids) > filters.max_pool_size:
                     continue
 
-                # Construire les outputs avec leurs prix de vente
+                # Construire les outputs avec leurs prix de vente ajustés
                 outputs_list: list[OutputSkin] = []
                 for out_id in output_ids:
                     sp_data = sell_prices.get(out_id, {})
-                    sp = sp_data.get("sell_price") or sp_data.get("buy_price")
-                    if sp and sp > 0:
-                        outputs_list.append(OutputSkin(
-                            skin_id=out_id,
-                            name=skin_names.get(out_id, out_id),
-                            sell_price=sp,
-                            volume_24h=sp_data.get("volume_24h", 0.0),
-                            source_sell=filters.source_sell,
-                        ))
+                    price_result = get_sell_price(sp_data)
+                    if price_result is None:
+                        continue  # insufficient_data → exclu
+                    if filters.exclude_trending_down and price_result.reliability == "trending_down":
+                        continue
+                    outputs_list.append(OutputSkin(
+                        skin_id=out_id,
+                        name=skin_names.get(out_id, out_id),
+                        sell_price=price_result.adjusted_price,
+                        volume_24h=sp_data.get("volume_24h", 0.0),
+                        source_sell=filters.source_sell,
+                        reliability=price_result.reliability,
+                    ))
 
                 if not outputs_list:
                     continue

@@ -61,7 +61,10 @@ class Price(Base):
     buy_price = Column(Float, nullable=True)
     sell_price = Column(Float, nullable=True)
     volume_24h = Column(Float, nullable=True)
-    volume_7d = Column(Float, nullable=True)
+    volume_7d  = Column(Float, nullable=True)
+    volume_30d = Column(Float, nullable=True)
+    avg_7d     = Column(Float, nullable=True)   # prix moyen sur 7 jours (détection tendance)
+    avg_30d    = Column(Float, nullable=True)   # prix moyen sur 30 jours (détection tendance)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     skin = relationship("Skin", back_populates="prices")
