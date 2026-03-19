@@ -24,11 +24,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UserFilters:
     min_roi: float = 10.0
-    max_budget: float = 100.0
+    max_budget: float = 200.0              # spec §4.3 : défaut 200 €
     max_pool_size: int = 5
     min_liquidity: float = 3.0
     min_volume_sell_price: int = 30        # ventes min pour fiabilité statistique (plage 10–100)
     exclude_trending_down: bool = False    # exclure outputs en baisse > 15% sur 30 jours
+    exclude_high_volatility: bool = False  # exclure outputs avec variation 24h > 15%
+    min_kontract_score: float = 0.0        # filtre composite Kontract Score
+    min_volume_input: float = 1.0          # liquidité minimum de l'input (ventes/j)
+    min_quantity_input: int = 10           # quantité minimum disponible pour exécution
     source_buy: str = "skinport"
     source_sell: str = "skinport"
 
@@ -165,10 +169,29 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
             if input_liquidity == "out_of_stock":
                 continue  # inexécutable — rejet
 
+            # Filtre liquidité input (volume journalier)
+            input_vol_24h = bp_data.get("volume_24h") or 0.0
+            if input_vol_24h < filters.min_volume_input:
+                continue
+
+            # Filtre quantité minimum (exécutabilité)
+            if quantity is not None and quantity < filters.min_quantity_input:
+                continue
+
             cost_10 = buy_price * 10
             if cost_10 > filters.max_budget:
                 f_budget += 1
                 continue
+
+            # ── Recipe velocity (spec §4.7) ──
+            # Détecte si les inputs sont en hausse rapide en 24h (signe de saturation)
+            inp_avg_24h = bp_data.get("avg_24h")
+            inp_avg_7d  = bp_data.get("avg_7d")
+            if inp_avg_24h and inp_avg_7d and inp_avg_7d > 0:
+                input_trend = (inp_avg_24h - inp_avg_7d) / inp_avg_7d
+            else:
+                input_trend = 0.0
+            velocity_alert = input_trend > 0.05
 
             for coll_id, output_ids in pool_idx[skin_id].items():
                 if len(output_ids) > filters.max_pool_size:
@@ -176,7 +199,6 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     continue
 
                 # Construire les outputs avec toutes les données historiques
-                # (fallback + trend detection effectués dans calculate_ev)
                 outputs_list: list[OutputSkin] = []
                 for out_id in output_ids:
                     sp_data = sell_prices.get(out_id, {})
@@ -223,6 +245,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                         source_sell=filters.source_sell,
                         min_vol_7d=filters.min_volume_sell_price,
                         exclude_trending_down=filters.exclude_trending_down,
+                        input_trend=input_trend,
                     )
                     checked += 1
                 except ValueError:
@@ -238,6 +261,18 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     f_roi += 1
                     continue
 
+                if filters.exclude_high_volatility and result.high_volatility:
+                    continue
+
+                if result.kontract_score < filters.min_kontract_score:
+                    continue
+
+                # ── Scalability (spec §4.7) ──
+                # max_repeats = min(qty_i // 10) pour tous les inputs
+                qty_val = quantity if quantity is not None else 999
+                max_repeats = qty_val // 10
+                bottleneck_skin = skin.name if max_repeats < 10 else None
+
                 combo_hash = f"{skin_id}:{coll_id}"
                 opportunities.append({
                     "combo_hash": combo_hash,
@@ -248,13 +283,20 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "roi": result.roi,
                     "cout_ajuste": result.cout_ajuste,
                     "pool_size": result.pool_size,
+                    "nb_valid_outputs": result.nb_valid_outputs,
                     "pool_score": result.pool_score,
-                    "liquidity_score": result.liquidity_score * 7, # Repasser en /7j pour affichage
+                    "liquidity_score": result.liquidity_score * 7,
                     "win_prob": result.win_prob,
                     "cv_pond": result.cv_pond,
                     "ev_ajustee": result.ev_ajustee,
+                    "floor_ratio": result.floor_ratio,
                     "kontract_score": result.kontract_score,
                     "price_reliability": result.price_reliability,
+                    "high_volatility": result.high_volatility,
+                    "input_liquidity_status": input_liquidity,
+                    "velocity_alert": velocity_alert,
+                    "max_repeats": max_repeats,
+                    "bottleneck_skin": bottleneck_skin,
                     "outputs": result.outputs,
                 })
 
@@ -290,6 +332,12 @@ def save_opportunities(opportunities: list[dict]) -> int:
                 existing.roi = opp["roi"]
                 existing.pool_size = opp["pool_size"]
                 existing.liquidity_score = opp["liquidity_score"]
+                existing.price_reliability = opp["price_reliability"]
+                existing.cv_pond = opp["cv_pond"]
+                existing.win_prob = opp["win_prob"]
+                existing.kontract_score = opp["kontract_score"]
+                existing.floor_ratio = opp["floor_ratio"]
+                existing.input_liquidity_status = opp["input_liquidity_status"]
             else:
                 session.add(Opportunity(
                     combo_hash=opp["combo_hash"],
@@ -298,6 +346,12 @@ def save_opportunities(opportunities: list[dict]) -> int:
                     roi=opp["roi"],
                     pool_size=opp["pool_size"],
                     liquidity_score=opp["liquidity_score"],
+                    price_reliability=opp["price_reliability"],
+                    cv_pond=opp["cv_pond"],
+                    win_prob=opp["win_prob"],
+                    kontract_score=opp["kontract_score"],
+                    floor_ratio=opp["floor_ratio"],
+                    input_liquidity_status=opp["input_liquidity_status"],
                 ))
                 saved += 1
         session.commit()

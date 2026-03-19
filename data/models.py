@@ -105,5 +105,10 @@ class Opportunity(Base):
     roi = Column(Float, nullable=False)
     pool_size = Column(Integer, nullable=False)
     liquidity_score = Column(Float, nullable=True)
-    price_reliability = Column(String, nullable=True)  # "high" | "medium" | "low"
+    price_reliability = Column(String, nullable=True)   # "high" | "medium" | "low"
+    cv_pond = Column(Float, nullable=True)
+    win_prob = Column(Float, nullable=True)
+    kontract_score = Column(Float, nullable=True)
+    floor_ratio = Column(Float, nullable=True)
+    input_liquidity_status = Column(String, nullable=True)  # "liquid" | "partial" | "scarce"
     created_at = Column(DateTime, default=datetime.utcnow)
