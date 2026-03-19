@@ -82,8 +82,11 @@ def check_input_liquidity(quantity: int | None, qty_needed: int = 10) -> str:
     """
     Évalue le statut de liquidité des inputs selon la quantité disponible (spec §4.5).
     Retourne : 'out_of_stock' | 'scarce' | 'partial' | 'liquid'
+    NOTE : None = quantité inconnue (colonne non encore peuplée) → 'liquid' par défaut
     """
-    if not quantity or quantity == 0:
+    if quantity is None:
+        return "liquid"   # inconnu → permissif (on a un prix, le skin existe)
+    if quantity == 0:
         return "out_of_stock"
     if quantity >= qty_needed:
         return "liquid"
@@ -134,10 +137,13 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
 
         opportunities = []
         checked = 0
+        # Compteurs de filtres pour diagnostic
+        f_no_pool = 0; f_budget = 0; f_pool_size = 0; f_no_output = 0; f_roi = 0; f_liquidity = 0; f_ev_err = 0
 
         for skin in eligible_inputs:
             skin_id = skin.id
             if skin_id not in pool_idx:
+                f_no_pool += 1
                 continue
 
             bp_data = buy_prices.get(skin_id, {})
@@ -161,10 +167,12 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
 
             cost_10 = buy_price * 10
             if cost_10 > filters.max_budget:
+                f_budget += 1
                 continue
 
             for coll_id, output_ids in pool_idx[skin_id].items():
                 if len(output_ids) > filters.max_pool_size:
+                    f_pool_size += 1
                     continue
 
                 # Construire les outputs avec toutes les données historiques
@@ -191,6 +199,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     ))
 
                 if not outputs_list:
+                    f_no_output += 1
                     continue
 
                 # Construire les 10 inputs identiques
@@ -217,13 +226,16 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     )
                     checked += 1
                 except ValueError:
+                    f_ev_err += 1
                     continue
 
                 # Vérifier liquidité minimale après redistribution
                 if result.liquidity_score * 7 < filters.min_liquidity:
+                    f_liquidity += 1
                     continue
 
                 if result.roi < filters.min_roi:
+                    f_roi += 1
                     continue
 
                 combo_hash = f"{skin_id}:{coll_id}"
@@ -252,6 +264,10 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
     logger.info(
         "Scan terminé : %d combos évalués, %d opportunités qualifiées (ROI ≥ %.0f%%)",
         checked, len(opportunities), filters.min_roi,
+    )
+    logger.info(
+        "Filtres : pas_pool=%d budget=%d pool_size=%d no_output=%d ev_err=%d roi=%d liquidity=%d | PASS=%d",
+        f_no_pool, f_budget, f_pool_size, f_no_output, f_ev_err, f_roi, f_liquidity, len(opportunities)
     )
     return opportunities
 
