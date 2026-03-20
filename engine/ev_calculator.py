@@ -140,7 +140,7 @@ def calculate_ev(
     outputs_by_collection: dict[str, list[OutputSkin]],
     source_buy: str = "skinport",
     source_sell: str = "skinport",
-    min_vol_7d: int = 7,
+    min_vol_7d: int = 30,
     exclude_trending_down: bool = False,
     input_trend: float = 0.0,        # (avg_24h - avg_7d) / avg_7d des inputs — détection recipe velocity
     input_liquidity_status: str = "liquid",  # "liquid" | "partial" | "scarce" — §4.5

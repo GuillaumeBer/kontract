@@ -45,17 +45,25 @@ def _opportunities_to_df(opps: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for opp in opps:
+        # Input liquidity emoji
+        liq_status = opp.get("input_liquidity_status", "liquid")
+        liq_emoji = {"liquid": "🟢", "partial": "🟡", "scarce": "🔴"}.get(liq_status, "⚪")
+        max_reps = opp.get("max_repeats", 0) or 0
+        inputs_label = f"{liq_emoji} x{max_reps}"
+        # Velocity badge
+        vel = "⚡ " if opp.get("velocity_alert") else ""
         rows.append({
-            "Input skin": opp["input_name"],
+            "Input skin": f"{vel}{opp['input_name']}",
             "Kontract Score": round(opp.get("kontract_score", 0.0), 2),
             "ROI (%)": round(opp["roi"], 1),
             "Win prob (%)": round(opp["win_prob"], 1),
+            "Floor (%)": round((opp.get("floor_ratio", 0.0) or 0.0) * 100, 1),
             "Fiabilité": opp.get("price_reliability", "low").upper(),
             "EV nette (€)": round(opp["ev_nette"], 2),
-            "EV ajustée (€)": round(opp.get("ev_ajustee", 0.0), 2),
-            "Coût 10x (€)": round(opp["cout_ajuste"], 2),
-            "Pool size": opp["pool_size"],
-            "CV pondéré": round(opp.get("cv_pond", 1.0), 3),
+            "Coût (€)": round(opp["cout_ajuste"], 2),
+            "Pool": opp["pool_size"],
+            "Inputs": inputs_label,
+            "Strat": opp.get("strategy_used", "pure"),
             "Liquidité": round(opp["liquidity_score"], 1),
             "_combo_hash": opp["combo_hash"],
             "_outputs": opp.get("outputs", []),
@@ -244,19 +252,33 @@ else:
             ks_label = "🟢 Excellent" if ks >= 0.5 else "🟡 Bon" if ks >= 0.2 else "🔴 Spéculatif" if ks < 0.1 else "🟠 Moyen"
             st.markdown(f"**Kontract Score** : {ks:.2f} — {ks_label}")
             st.markdown(f"**Input** : {selected['input_name']}")
-            st.markdown(f"**Coût 10x inputs** : {selected['cout_ajuste']:.2f}€")
+            st.markdown(f"**Stratégie** : {selected.get('strategy_used', 'pure').upper()}")
+            st.markdown(f"**Coût inputs** : {selected['cout_ajuste']:.2f}€")
             st.markdown(f"**EV nette** : {selected['ev_nette']:.2f}€")
-            st.markdown(f"**EV ajustée** : {selected.get('ev_ajustee', 0):.2f}€ *(EV × win prob)*")
             st.markdown(f"**ROI** : {selected['roi']:.1f}%")
             st.markdown(f"**Win probability** : {selected['win_prob']:.1f}%")
+            
+            # Floor ratio
+            floor_ratio = selected.get("floor_ratio", 0.0) or 0.0
+            st.markdown(f"**Floor ratio** : {floor_ratio:.1%} (pire outcome / coût)")
             
             rel = selected.get("price_reliability", "low").upper()
             rel_color = "🟢" if "STABLE" in rel or "UP" in rel else "🟡" if "DOWN" in rel else "🔴"
             st.markdown(f"**Fiabilité prix** : {rel_color} {rel}")
             
             st.markdown(f"**Pool size** : {selected['pool_size']} outcomes possibles")
-            st.markdown(f"**CV pondéré** : {selected.get('cv_pond', 1):.3f} (0 = outputs équilibrés, ↑ = asymétrie)") 
-            st.markdown(f"**Liquidité** : {selected['liquidity_score']:.1f}")
+            st.markdown(f"**CV pondéré** : {selected.get('cv_pond', 1):.3f}")
+            st.markdown(f"**Liquidité output** : {selected['liquidity_score']:.1f}")
+
+            # Input liquidity & scalability
+            liq_status = selected.get("input_liquidity_status", "liquid")
+            liq_emoji = {"liquid": "🟢", "partial": "🟡", "scarce": "🔴"}.get(liq_status, "⚪")
+            max_reps = selected.get("max_repeats", 0) or 0
+            st.markdown(f"**Inputs** : {liq_emoji} {liq_status} | **Répétable** : {max_reps}×")
+
+            # Velocity alert
+            if selected.get("velocity_alert"):
+                st.warning("⚡ Les inputs de ce trade-up montent — fenêtre de profit en cours de fermeture.")
 
         with d2:
             outputs = selected.get("outputs", [])

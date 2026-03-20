@@ -6,6 +6,7 @@ Le scanner identifie les trade-ups avec EV positive en parcourant :
   - Tous les skins avec prix d'achat disponible
   - Tous les outputs possibles depuis tradeup_pool
   - Filtres configurables par utilisateur (ROI, budget, pool, liquidité)
+  - Deux stratégies : pure (10 même collection) et fillers (7+3 collection mixte)
 """
 
 import json
@@ -136,9 +137,118 @@ def validate_tradeup(skins: list) -> tuple[bool, str]:
     return True, "valid"
 
 
+def _build_filler_index(
+    eligible_skins: list,
+    buy_prices: dict[str, dict],
+    pool_idx: dict[str, dict[str, list[str]]],
+) -> dict[str, list[tuple]]:
+    """
+    Build an index: rarity_id → [(skin_id, collection_id, buy_price, quantity)] sorted by price.
+    Used to find the cheapest skins of a given rarity from OTHER collections for filler strategy.
+    """
+    rarity_skins: dict[str, list[tuple]] = {}
+    for skin in eligible_skins:
+        bp_data = buy_prices.get(skin.id, {})
+        price = bp_data.get("buy_price")
+        if not price or price <= 0:
+            continue
+        qty = bp_data.get("quantity")
+        # Only include skins that have outputs (are valid trade-up inputs)
+        if skin.id not in pool_idx:
+            continue
+        entry = (skin.id, skin.collection_id, price, qty, skin.name)
+        rarity_skins.setdefault(skin.rarity_id, []).append(entry)
+
+    # Sort each rarity by price ascending
+    for rarity in rarity_skins:
+        rarity_skins[rarity].sort(key=lambda x: x[2])
+
+    return rarity_skins
+
+
+def _get_cheapest_fillers(
+    filler_index: dict[str, list[tuple]],
+    rarity_id: str,
+    exclude_collection_id: str,
+    n: int = 3,
+) -> list[tuple]:
+    """
+    Get the n cheapest skins of the given rarity from collections OTHER than exclude_collection_id.
+    Returns list of (skin_id, collection_id, buy_price, quantity, name).
+    """
+    candidates = filler_index.get(rarity_id, [])
+    fillers = []
+    for entry in candidates:
+        if entry[1] != exclude_collection_id:
+            fillers.append(entry)
+            if len(fillers) >= n:
+                break
+    return fillers
+
+
+def _build_outputs_by_collection(
+    output_ids_by_coll: dict[str, list[str]],
+    sell_prices: dict[str, dict],
+    skin_names: dict[str, str],
+    source_sell: str,
+) -> dict[str, list[OutputSkin]]:
+    """Build OutputSkin lists grouped by collection_id."""
+    result = {}
+    for coll_id, out_ids in output_ids_by_coll.items():
+        outputs = []
+        for out_id in out_ids:
+            sp_data = sell_prices.get(out_id, {})
+            outputs.append(OutputSkin(
+                skin_id=out_id,
+                name=skin_names.get(out_id, out_id),
+                sell_price=sp_data.get("sell_price") or 0.0,
+                volume_24h=sp_data.get("volume_24h", 0.0),
+                volume_7d=sp_data.get("volume_7d", 0.0),
+                volume_30d=sp_data.get("volume_30d", 0.0),
+                median_24h=sp_data.get("median_24h"),
+                median_7d=sp_data.get("median_7d"),
+                median_30d=sp_data.get("median_30d"),
+                median_90d=sp_data.get("median_90d"),
+                avg_24h=sp_data.get("avg_24h"),
+                avg_7d=sp_data.get("avg_7d"),
+                avg_30d=sp_data.get("avg_30d"),
+                avg_90d=sp_data.get("avg_90d"),
+                source_sell=source_sell,
+            ))
+        if outputs:
+            result[coll_id] = outputs
+    return result
+
+
+def _try_evaluate(
+    inputs_list: list[InputSkin],
+    outputs_by_coll: dict[str, list[OutputSkin]],
+    filters: UserFilters,
+    input_trend: float,
+    input_liquidity: str,
+    input_vol_24h: float,
+) -> "EVResult | None":
+    """Try to evaluate a trade-up, return EVResult or None if error/filtered."""
+    try:
+        return calculate_ev(
+            inputs_list,
+            outputs_by_coll,
+            source_buy=filters.source_buy,
+            source_sell=filters.source_sell,
+            min_vol_7d=filters.min_volume_sell_price,
+            exclude_trending_down=filters.exclude_trending_down,
+            input_trend=input_trend,
+            input_liquidity_status=input_liquidity,
+            vol_24h_input=input_vol_24h,
+        )
+    except ValueError:
+        return None
+
+
 def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
     """
-    Scanne toutes les combinaisons de trade-up mono-collection (10 inputs identiques).
+    Scanne toutes les combinaisons de trade-up : pure (10 même collection) + fillers (7+3).
+    Pour chaque input, compare les deux stratégies et garde la meilleure ROI.
     """
     if filters is None:
         filters = UserFilters()
@@ -163,6 +273,11 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
 
         # Charger les noms des skins pour les outputs
         skin_names: dict[str, str] = {s.id: s.name for s in session.query(Skin).all()}
+        skin_rarities: dict[str, str] = {s.id: s.rarity_id for s in session.query(Skin).all()}
+        skin_colls: dict[str, str] = {s.id: s.collection_id for s in session.query(Skin).all()}
+
+        # Build filler index for strategy B (spec §4.4)
+        filler_index = _build_filler_index(eligible_inputs, buy_prices, pool_idx)
 
         opportunities = []
         checked = 0
@@ -214,7 +329,6 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                 continue
 
             # ── Recipe velocity (spec §4.7) ──
-            # Détecte si les inputs sont en hausse rapide en 24h (signe de saturation)
             inp_avg_24h = bp_data.get("avg_24h")
             inp_avg_7d  = bp_data.get("avg_7d")
             if inp_avg_24h and inp_avg_7d and inp_avg_7d > 0:
@@ -228,61 +342,117 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     f_pool_size += 1
                     continue
 
-                # Construire les outputs avec toutes les données historiques
-                outputs_list: list[OutputSkin] = []
-                for out_id in output_ids:
-                    sp_data = sell_prices.get(out_id, {})
-                    outputs_list.append(OutputSkin(
-                        skin_id=out_id,
-                        name=skin_names.get(out_id, out_id),
-                        sell_price=sp_data.get("sell_price") or 0.0,
-                        volume_24h=sp_data.get("volume_24h", 0.0),
-                        volume_7d=sp_data.get("volume_7d", 0.0),
-                        volume_30d=sp_data.get("volume_30d", 0.0),
-                        median_24h=sp_data.get("median_24h"),
-                        median_7d=sp_data.get("median_7d"),
-                        median_30d=sp_data.get("median_30d"),
-                        median_90d=sp_data.get("median_90d"),
-                        avg_24h=sp_data.get("avg_24h"),
-                        avg_7d=sp_data.get("avg_7d"),
-                        avg_30d=sp_data.get("avg_30d"),
-                        avg_90d=sp_data.get("avg_90d"),
-                        source_sell=filters.source_sell,
-                    ))
-
-                if not outputs_list:
+                # Build outputs for the target collection
+                outputs_by_coll = _build_outputs_by_collection(
+                    {coll_id: output_ids}, sell_prices, skin_names, filters.source_sell,
+                )
+                if not outputs_by_coll:
                     f_no_output += 1
                     continue
 
-                # Construire les inputs (5 pour Covert, 10 sinon — spec §4.4)
-                inputs_list = [
-                    InputSkin(
-                        skin_id=skin_id,
-                        name=skin.name,
-                        collection_id=coll_id,
-                        rarity_id=skin.rarity_id,
-                        buy_price=buy_price,
-                        source_buy=filters.source_buy,
-                    )
+                # ══════════════════════════════════════════════════════
+                # STRATEGY A — Pure collection (10 inputs same collection)
+                # ══════════════════════════════════════════════════════
+                pure_inputs = [
+                    InputSkin(skin_id, skin.name, coll_id, skin.rarity_id,
+                              buy_price, filters.source_buy)
                     for _ in range(n_inputs)
                 ]
-
-                try:
-                    result = calculate_ev(
-                        inputs_list,
-                        {coll_id: outputs_list},
-                        source_buy=filters.source_buy,
-                        source_sell=filters.source_sell,
-                        min_vol_7d=filters.min_volume_sell_price,
-                        exclude_trending_down=filters.exclude_trending_down,
-                        input_trend=input_trend,
-                        input_liquidity_status=input_liquidity,
-                        vol_24h_input=input_vol_24h,
-                    )
+                result_pure = _try_evaluate(
+                    pure_inputs, outputs_by_coll, filters,
+                    input_trend, input_liquidity, input_vol_24h,
+                )
+                if result_pure:
                     checked += 1
-                except ValueError:
+
+                # ══════════════════════════════════════════════════════
+                # STRATEGY B — Fillers (7 target + 3 cheap from other collections)
+                # Only for non-Covert (10 inputs) — spec §4.4
+                # ══════════════════════════════════════════════════════
+                result_filler = None
+                filler_info = None
+                if n_inputs == 10:
+                    fillers = _get_cheapest_fillers(
+                        filler_index, skin.rarity_id, coll_id, n=3
+                    )
+                    if len(fillers) >= 3:
+                        # Build the mixed outputs_by_collection (target + filler collections)
+                        filler_colls = set()
+                        filler_inputs = []
+                        mixed_outputs_by_coll = dict(outputs_by_coll)  # start with target coll
+
+                        for f_skin_id, f_coll_id, f_price, f_qty, f_name in fillers:
+                            filler_colls.add(f_coll_id)
+                            filler_inputs.append(
+                                InputSkin(f_skin_id, f_name, f_coll_id, skin.rarity_id,
+                                          f_price, filters.source_buy)
+                            )
+
+                        # Add filler collection outputs to the output map
+                        for f_coll_id in filler_colls:
+                            if f_coll_id not in mixed_outputs_by_coll:
+                                # Find output IDs for this filler in its collection
+                                # We need outputs of the NEXT tier in the filler's collection
+                                filler_out_ids = []
+                                for f_entry in fillers:
+                                    if f_entry[1] == f_coll_id:
+                                        f_sid = f_entry[0]
+                                        if f_sid in pool_idx and f_coll_id in pool_idx[f_sid]:
+                                            filler_out_ids.extend(pool_idx[f_sid][f_coll_id])
+                                filler_out_ids = list(set(filler_out_ids))
+                                if filler_out_ids:
+                                    filler_outs = _build_outputs_by_collection(
+                                        {f_coll_id: filler_out_ids},
+                                        sell_prices, skin_names, filters.source_sell,
+                                    )
+                                    mixed_outputs_by_coll.update(filler_outs)
+
+                        # Build 7 target + 3 filler inputs
+                        mixed_inputs = [
+                            InputSkin(skin_id, skin.name, coll_id, skin.rarity_id,
+                                      buy_price, filters.source_buy)
+                            for _ in range(7)
+                        ] + filler_inputs
+
+                        # Check total cost
+                        filler_cost = sum(f[2] for f in fillers)
+                        total_mixed_cost = buy_price * 7 + filler_cost
+                        if total_mixed_cost <= filters.max_budget:
+                            result_filler = _try_evaluate(
+                                mixed_inputs, mixed_outputs_by_coll, filters,
+                                input_trend, input_liquidity, input_vol_24h,
+                            )
+                            if result_filler:
+                                checked += 1
+                                filler_info = {
+                                    "filler_skins": [f[4] for f in fillers],
+                                    "filler_cost": filler_cost,
+                                }
+
+                # ══════════════════════════════════════════════════════
+                # Pick the best strategy by ROI
+                # ══════════════════════════════════════════════════════
+                best_result = None
+                strategy_used = "pure"
+
+                if result_pure and result_filler:
+                    if result_filler.roi > result_pure.roi:
+                        best_result = result_filler
+                        strategy_used = "fillers"
+                    else:
+                        best_result = result_pure
+                        strategy_used = "pure"
+                elif result_pure:
+                    best_result = result_pure
+                    strategy_used = "pure"
+                elif result_filler:
+                    best_result = result_filler
+                    strategy_used = "fillers"
+                else:
                     f_ev_err += 1
                     continue
+
+                result = best_result
 
                 # Vérifier liquidité minimale après redistribution
                 if result.liquidity_score * 7 < filters.min_liquidity:
@@ -300,13 +470,12 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     continue
 
                 # ── Scalability (spec §4.7) ──
-                # max_repeats = min(qty_i // n_inputs) pour tous les inputs
                 qty_val = quantity if quantity is not None else 999
                 max_repeats = qty_val // n_inputs
                 bottleneck_skin = skin.name if max_repeats < 10 else None
 
                 combo_hash = f"{skin_id}:{coll_id}"
-                opportunities.append({
+                opp_dict = {
                     "combo_hash": combo_hash,
                     "input_skin_id": skin_id,
                     "input_name": skin.name,
@@ -326,13 +495,17 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "kontract_score": result.kontract_score,
                     "price_reliability": result.price_reliability,
                     "high_volatility": result.high_volatility,
-                    "strategy_used": "pure",
+                    "strategy_used": strategy_used,
                     "input_liquidity_status": input_liquidity,
                     "velocity_alert": velocity_alert,
                     "max_repeats": max_repeats,
                     "bottleneck_skin": bottleneck_skin,
                     "outputs": result.outputs,
-                })
+                }
+                if filler_info and strategy_used == "fillers":
+                    opp_dict["filler_skins"] = filler_info["filler_skins"]
+                    opp_dict["filler_cost"] = filler_info["filler_cost"]
+                opportunities.append(opp_dict)
 
     # Tri par ROI décroissant
     opportunities.sort(key=lambda x: x["roi"], reverse=True)
@@ -373,6 +546,7 @@ def save_opportunities(opportunities: list[dict]) -> int:
                 existing.kontract_score = opp["kontract_score"]
                 existing.floor_ratio = opp["floor_ratio"]
                 existing.input_liquidity_status = opp["input_liquidity_status"]
+                existing.strategy_used = opp["strategy_used"]
                 existing.cout_ajuste = opp["cout_ajuste"]
                 existing.high_volatility = opp["high_volatility"]
             else:
@@ -390,7 +564,7 @@ def save_opportunities(opportunities: list[dict]) -> int:
                     kontract_score=opp["kontract_score"],
                     floor_ratio=opp["floor_ratio"],
                     input_liquidity_status=opp["input_liquidity_status"],
-                    strategy_used="pure",
+                    strategy_used=opp["strategy_used"],
                     cout_ajuste=opp["cout_ajuste"],
                     high_volatility=opp["high_volatility"],
                 ))
@@ -407,7 +581,7 @@ if __name__ == "__main__":
     opps = scan_all_opportunities(filters)
 
     print(f"\n{len(opps)} opportunités trouvées (ROI ≥ {filters.min_roi}%)\n")
-    print(f"{'Input skin':<40} {'ROI':>7} {'EV nette':>9} {'Pool':>6} {'Vol 24h':>8}")
+    print(f"{'Input skin':<40} {'ROI':>7} {'EV nette':>9} {'Pool':>6} {'Strat':>8}")
     print("-" * 75)
     for opp in opps[:20]:
         print(
@@ -415,16 +589,17 @@ if __name__ == "__main__":
             f"{opp['roi']:>6.1f}% "
             f"{opp['ev_nette']:>8.2f}€ "
             f"{opp['pool_size']:>6} "
-            f"{opp['liquidity_score']:>8.1f}"
+            f"{opp['strategy_used']:>8}"
         )
 
     if opps:
         print(f"\nMeilleure opportunité :")
         best = opps[0]
-        print(f"  Input  : {best['input_name']} (coût 10x = {best['cout_ajuste']:.2f}€)")
+        print(f"  Input  : {best['input_name']} (coût = {best['cout_ajuste']:.2f}€)")
         print(f"  ROI    : {best['roi']:.1f}%")
         print(f"  EV nette : {best['ev_nette']:.2f}€")
         print(f"  Win prob : {best['win_prob']:.1f}%")
+        print(f"  Strategy : {best['strategy_used']}")
         print("  Outputs :")
         for o in best["outputs"][:5]:
             print(f"    {o['name']}: {o['prob']}% → {o['sell_price']:.2f}€")
