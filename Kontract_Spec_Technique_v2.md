@@ -14,19 +14,25 @@ Version 2.0 — Mars 2026
 2. [Sources de données — 100% gratuit](#2-sources-de-données--100-gratuit)
 3. [Architecture technique](#3-architecture-technique)
 4. [Spécifications fonctionnelles](#4-spécifications-fonctionnelles)
-   - 4.1 BDD Collections
-   - 4.2 Agrégateur de prix
-   - 4.3 Moteur de calcul EV
-   - 4.4 Sélection et gestion des inputs (filtres + score hybride)
-   - 4.4.2 Suivi du panier — PanierState
-   - 4.5 Liquidité des inputs
-   - 4.6 Kontract Score v3
-   - 4.7 Détections avancées (recipe velocity, pump, scalability, Kelly, Doppler)
-   - 4.7.1 Décision d'abandon de panier
-   - 4.8 Portfolio Engine + BuyAlertEngine
-   - 4.9 Exécution & Détection automatique de l'output
-   - 4.10 P&L Tracker
-   - 4.11 Interface utilisateur — 4 pages
+   - 4.1   Module 1  — BDD Collections (ByMykel)
+   - 4.2   Module 2  — Agrégateur de prix (Skinport REST + WebSocket)
+   - 4.3   Module 3  — Moteur EV (formule post-oct 2025, float-conditional, hold discount)
+   - 4.4   Module 4  — Sélection inputs : hard filters + score hybride listings
+   - 4.4.2 Module 4b — Suivi du panier (PanierState + sync Steam inventaire)
+   - 4.5   Module 5  — Liquidité des inputs
+   - 4.6   Module 6  — Kontract Score v4 (Sharpe ratio + momentum multiplier)
+   - 4.7   Module 7  — Détections avancées (recipe velocity, pump, scalability, Kelly, Doppler, StatTrak)
+   - 4.7.1            Décision d'abandon de panier (should_abandon_basket)
+   - 4.7.2            PriceSignalEngine — 9 signaux faibles + momentum score
+   - 4.8   Module 8  — Portfolio Engine + BuyAlertEngine (WebSocket temps réel)
+   - 4.9   Module 9  — Exécution CS2 & Détection automatique de l'output (OutputDetector)
+   - 4.10  Module 10 — P&L Tracker (enregistrement, précision EV, float accuracy)
+   - 4.11  Module 11 — OutputSellEngine (décision hold/sell, stop-loss, vélocité capital)
+   - 4.13  Module 13 — ActionRecommender (plan d'actions : items exacts + liens directs)
+   - 4.14             Interface utilisateur — 5 pages (Plan, Scanner, Portefeuille, Calculateur, P&L)
+   - 4.15             Fonctions utilitaires — 16 helpers (calculate_ev, notify_*, etc.)
+   - 4.16             Stratégies avancées (reverse finder, Covert, StatTrak, liquidity decay, backtesting)
+   - 4.17             Module LLM — 5 LLM calls (patch analyzer, explainer, signals, onboarding, briefing)
 5. [Stack technique](#5-stack-technique)
 6. [Roadmap](#6-roadmap)
 7. [Risques & mitigations](#7-risques--mitigations)
@@ -218,7 +224,8 @@ Après analyse des tarifs réels (mars 2026), Pricempire API est exclue du MVP.
 | 4.8 Portfolio Engine | Gestion multi-paniers, BuyAlertEngine WebSocket | Python + socket.io | MVP/V1 |
 | 4.9 Exécution & Output | OutputDetector, snapshot inventaire | Python + Steam API + CSFloat | V1 |
 | 4.10 P&L Tracker | Enregistrement résultats, précision EV | Python | V1 |
-| 4.11 Interface UI | 4 pages : Scanner / Portefeuille / Calculateur / P&L | Streamlit → React | MVP/V2 |
+| 4.11 ActionRecommender | Plan d'actions complet — items exacts + liens directs buy/sell | Python | MVP/V1 |
+| 4.12 Interface UI | 5 pages : Plan d'action (accueil) / Scanner / Portefeuille / Calculateur / P&L | Streamlit → React | MVP/V2 |
 
 ### 3.2 Flux de données — séquence complète
 
@@ -309,7 +316,13 @@ user_alerts  : user_id, min_roi, max_budget, max_pool_size,
                min_liquidity, min_input_qty,
                source_buy, source_sell,
                exclude_trending_down, exclude_high_volatility,
-               min_kontract_score, active
+               min_kontract_score,
+               -- Configuration slots (calculés via compute_optimal_slots)
+               bankroll,            -- capital total déclaré par l'utilisateur
+               max_simultaneous,    -- plafond humain de slots (défaut 5)
+               slots_optimal,       -- calculé automatiquement
+               capital_par_slot,    -- calculé automatiquement
+               active
 
 opportunities: id, combo_hash,
                inputs_json,            -- liste des inputs retenus
@@ -324,7 +337,16 @@ opportunities: id, combo_hash,
                input_liquidity_status, -- liquid / partial / scarce
                price_reliability,      -- worst-case reliability des outputs
                high_volatility,        -- flag volatilité 24h
-               kontract_score,         -- score composite final
+               -- Momentum / PriceSignalEngine (v4)
+               output_momentum_score,  -- score −0.5 à +1.0 (PriceSignalEngine)
+               output_momentum_verdict,-- strong_up | moderate_up | neutral | cautious
+               collection_inactive,    -- booléen : collection hors pool de drop
+               trend_7d_30d,           -- (avg_7j - avg_30j) / avg_30j de l'output
+               pump_candidate,         -- booléen : score pump > 17 + conditions
+               seasonal_phase,         -- label saisonnalité (steam_summer_sale, etc.)
+               vol_acceleration,       -- vol_7j / (vol_30j/4.3) - 1
+               momentum_multiplier,    -- facteur 0.75–1.30 appliqué au score
+               kontract_score,         -- score composite final (v4)
                created_at
 
 -- Suivi du panier en cours
@@ -705,7 +727,7 @@ high_volatility   = any("high_volatility" in r for r in reliability_list)
 
 ---
 
-### 4.4 Module 3 — Sélection et gestion des inputs
+### 4.4 Module 4 — Sélection et gestion des inputs
 
 #### Contraintes de composition — règles Valve
 
@@ -1476,7 +1498,7 @@ Kontract Score      : 24.7
 
 ---
 
-### 4.5 Module 3 — Liquidité des inputs
+### 4.5 Module 5 — Liquidité des inputs
 
 La liquidité des inputs est aussi importante que celle des outputs, mais dans le sens inverse : elle détermine si l'opportunité est **exécutable** à un prix réaliste. L'ignorer crée un biais optimiste systématique sur le coût ajusté.
 
@@ -1612,7 +1634,7 @@ Un utilisateur conservateur exigera `quantity ≥ 10` pour s'assurer de pouvoir 
 
 ---
 
-### 4.6 Module 3 — Kontract Score
+### 4.6 Module 6 — Kontract Score v4
 
 Le Kontract Score est un indicateur composite de 0 à +∞ (sans borne supérieure théorique) qui synthétise toutes les dimensions d'une opportunité en un seul chiffre. C'est le **critère de tri par défaut** du dashboard et la valeur affichée en tête de chaque alerte Telegram.
 
@@ -1706,13 +1728,15 @@ input_speed_bonus  = ln(1 + vol_24h_inputs_min)
 ```python
 def calculate_kontract_score(opportunity: dict) -> float:
     """
-    Kontract Score v3 — intègre:
+    Kontract Score v4 — intègre:
     - Sharpe ratio (EV/CV) au lieu du double-comptage win_prob × EV
     - Liquidité inputs/outputs pondérée par probabilité
     - Discount trade hold 7j
     - Pénalité haute volatilité
     - Floor ratio (pire outcome / coût)
-    - Recipe velocity detection
+    - Recipe velocity detection (inputs en hausse = fenêtre qui se ferme)
+    - Momentum score output (PriceSignalEngine — collection inactive,
+      tendance prix, accélération volume, saisonnalité, pump pattern)
     Pas de borne supérieure théorique. Tri par ordre décroissant.
     """
     from math import sqrt, log
@@ -1725,6 +1749,7 @@ def calculate_kontract_score(opportunity: dict) -> float:
     vol_24h_inputs         = opportunity["vol_24h_inputs"]
     hold_days              = opportunity.get("hold_days", 7)
     input_price_trend      = opportunity.get("input_price_trend_7d", 0.0)  # recipe velocity
+    output_momentum        = opportunity.get("output_momentum_score", 0.0) # PriceSignalEngine
 
     prix_outputs = [o["prix"] for o in outputs]
 
@@ -1777,6 +1802,16 @@ def calculate_kontract_score(opportunity: dict) -> float:
         "high_volatility" in o.get("reliability", "") for o in outputs
     ) else 1.00
 
+    # ── Momentum multiplier — PriceSignalEngine (output signals) ───────
+    # Convertit le momentum_score (−0.5 à +1.0) en multiplicateur (0.75 à 1.30)
+    # Score neutre (0.0) → multiplier 1.00 (aucun effet)
+    # Fort signal haussier (+0.55) → multiplier 1.30 (+30%)
+    # Conditions défavorables (−0.30) → multiplier 0.85 (−15%)
+    if output_momentum >= 0:
+        momentum_mult = min(1.30, 1.0 + output_momentum * 0.545)
+    else:
+        momentum_mult = max(0.75, 1.0 + output_momentum * 0.500)
+
     # ── Score final ──────────────────────────────────────────────────────
     kontract_score = (
         score_risque
@@ -1787,14 +1822,17 @@ def calculate_kontract_score(opportunity: dict) -> float:
         * (1 + 0.15 * input_speed_bonus)
         * velocity_penalty
         * volatility_factor
+        * momentum_mult          # ← nouveau : amplificateur/atténuateur marché
     )
 
     return round(kontract_score, 2), {
-        "win_prob":       round(win_prob, 3),    # affiché dans l'UI
-        "floor_ratio":    round(floor_ratio, 3), # affiché dans l'UI
-        "cv_pond":        round(cv_pond, 3),
-        "hold_days":      hold_days,
-        "velocity_alert": input_price_trend > 0.10,
+        "win_prob":          round(win_prob, 3),         # affiché dans l'UI
+        "floor_ratio":       round(floor_ratio, 3),      # affiché dans l'UI
+        "cv_pond":           round(cv_pond, 3),
+        "hold_days":         hold_days,
+        "velocity_alert":    input_price_trend > 0.10,
+        "momentum_score":    round(output_momentum, 3),  # affiché dans l'UI
+        "momentum_mult":     round(momentum_mult, 3),
     }
 ```
 
@@ -1802,37 +1840,63 @@ def calculate_kontract_score(opportunity: dict) -> float:
 
 #### Exemples chiffrés
 
-**Opportunité A — Solide et exécutable**
+**Opportunité A — Solide, exécutable, contexte favorable**
 ROI 18%, inputs liquides (qty=40, vol_24h=8), output 40 ventes/7j, pool 3 équilibré
+Collection inactive depuis 18 mois, tendance prix 7j/30j = +8%, Steam Summer Sale actif
 
 ```
-ev_nette=9€, win_prob=0.85, jackpot_ratio=1.4, vol_24h_min=8
-ev_ajustee    = 9 × 0.85 = 7.65
-score_risque  = 7.65 / √1.4 = 6.46
-liquidity_out = (0.33×40 + 0.33×35 + 0.33×38) / 7 = 5.38
-bonus_out     = ln(1 + 5.38) = 1.87
+ev_nette=9€, cv_pond=1.4, vol_24h_min=8, floor_ratio=0.42
+score_risque  = 9 / √1.4 = 7.61
+floor_factor  = 1.00  (floor_ratio >= 0.20)
+bonus_out     = ln(1 + (0.33×40+0.33×35+0.33×38)/7) = ln(6.38) = 1.85
+hold_discount = 1 - 0.005×7 = 0.965
 input_exec    = 1.00  (liquid)
 speed_bonus   = ln(1 + 8) = 2.20
+velocity_pen  = 1.00  (inputs stables)
+volatility    = 1.00
 
-kontract_score = 6.46 × 1.00 × (1 + 1.87) × (1 + 0.15 × 2.20) = 6.46 × 2.87 × 1.33 = 24.7
+-- Momentum v4 --
+momentum_score = 0.25 (inactive) + 0.10 (trend +8%) + 0.07 (vol accél +30%)
+               + 0.15 (Steam Summer Sale) = 0.57
+momentum_mult  = min(1.30, 1.0 + 0.57 × 0.545) = 1.31 → cappé à 1.30
+
+kontract_score = 7.61 × 1.00 × (1+1.85) × 0.965 × 1.00 × (1+0.15×2.20)
+               × 1.00 × 1.00 × 1.30
+             = 7.61 × 2.85 × 0.965 × 1.33 × 1.30
+             = 36.4
 ```
 
-**Opportunité B — ROI élevé mais risquée**
-ROI 35%, inputs scarces (qty=2, vol_24h=0.3), output 8 ventes/7j, pool jackpot asymétrique
+**Opportunité A — même opportunité, contexte neutre (hors Steam Sale, collection active)**
+```
+Même paramètres mais momentum_score = 0.00 → momentum_mult = 1.00
+kontract_score = 7.61 × 2.85 × 0.965 × 1.33 × 1.00 = 28.0
+```
+
+L'impact du contexte marché : **28.0 → 36.4 (+30%)** grâce au signal saisonnier et à la collection inactive. L'opportunité est la même, mais le moment d'entrée est beaucoup plus favorable.
+
+**Opportunité B — ROI élevé mais risquée + contexte défavorable**
+ROI 35%, inputs scarces, output peu liquide, collection active, rentrée scolaire septembre
 
 ```
-ev_nette=18€, win_prob=0.45, jackpot_ratio=8.5, vol_24h_min=0.3
-ev_ajustee    = 18 × 0.45 = 8.10
-score_risque  = 8.10 / √8.5 = 2.78
-liquidity_out = (0.05×8 + 0.95×1) / 7 = 0.19   ← jackpot pondéré à 5%
+ev_nette=18€, cv_pond=8.5, floor_ratio=0.08
+score_risque  = 18 / √8.5 = 6.18
+floor_factor  = 0.5 + 0.08×2.5 = 0.70  (floor trop bas)
 bonus_out     = ln(1 + 0.19) = 0.17
+hold_discount = 0.965
 input_exec    = 0.40  (scarce)
 speed_bonus   = ln(1 + 0.3) = 0.26
 
-kontract_score = 2.78 × 0.40 × (1 + 0.17) × (1 + 0.15 × 0.26) = 2.78 × 0.40 × 1.17 × 1.04 = 1.35
+-- Momentum v4 --
+momentum_score = 0.00 (collection active) + 0.00 (trend plat)
+               + 0.00 (volume normal) - 0.08 (back_to_school) = -0.08
+momentum_mult  = max(0.75, 1.0 + (-0.08)×0.500) = 0.96
+
+kontract_score = 6.18 × 0.70 × (1+0.17) × 0.965 × 0.40 × (1+0.15×0.26)
+               × 1.00 × 1.00 × 0.96
+             = 1.85
 ```
 
-Malgré un ROI presque deux fois supérieur, l'opportunité B obtient un Kontract Score **18× plus bas** que l'opportunité A. Le score reflète correctement qu'elle est difficile à exécuter, peu liquide, et très asymétrique.
+Malgré un ROI deux fois supérieur, l'opportunité B obtient un Kontract Score **20× plus bas** que A. La pénalité combinée du floor ratio trop bas, des inputs peu liquides, et du contexte saisonnier défavorable reflète correctement le risque réel.
 
 ---
 
@@ -1852,6 +1916,11 @@ Malgré un ROI presque deux fois supérieur, l'opportunité B obtient un Kontrac
 | 10 | Anomalie min_price | Revue interne | Non détectée | `is_price_anomaly()` |
 | 11 | Haute volatilité 24h | Revue interne | Non détectée | Flag + `× 0.70` |
 | 12 | Frais centralisés | Revue interne | Commentaires éparses | Dict `FEES` versionné |
+| 13 | Contexte marché ignoré | Recherche communautaire mars 2026 | Absent | `PriceSignalEngine` → `momentum_multiplier` 0.75–1.30 dans le Kontract Score |
+| 14 | Collection inactive non valorisée | Recherche communautaire | Absent | Signal S1 : +0.25 sur momentum_score |
+| 15 | Saisonnalité absente | Recherche communautaire | Absent | Calendrier 12 mois intégré dans PriceSignalEngine |
+| 16 | Pump candidat output non détecté | Key-Drop research 2026 | Absent | Score pump `log(price)/log(supply_fn) > 17` |
+| 17 | Corrélation inter-skins absente | Recherche académique 2025 | Absent | Signal S6 : tendance collection voisine |
 
 ---
 
@@ -1869,16 +1938,17 @@ Score   Trade-up                              ROI    Tendance  Pool
 Dans l'alerte Telegram :
 
 ```
-🎯 Kontract Score : 24.7
+🎯 Kontract Score : 36.4  (+30% vs neutre)
 AK-47 Redline FT → AWP Fever Dream FN
 ROI : +18% | EV nette : +9.20€ | win_prob : 85% | floor : 42%
 Pool : 3 outcomes | Inputs : 🟢 liquid (qty=40) | Kelly : 2.3% du bankroll
 Output liquidité : 40 ventes/7j | Prix : 🟢 stable | Répétable 8×
+📈📈 Momentum : +57% — collection inactive + tendance +8% + Steam Summer Sale
 ```
 
 ---
 
-### 4.7 Module 3 — Détections avancées et métriques complémentaires
+### 4.7 Module 7 — Détections avancées et métriques complémentaires
 
 #### Recipe velocity — détection de trade-up viral
 
@@ -2123,6 +2193,295 @@ Ignorer   : /continue <basket_id>
 
 ---
 
+
+### 4.7.2 Module — PriceSignalEngine (signaux faibles de marché)
+
+#### Contexte et justification
+
+La recherche communautaire et académique (mars 2026) identifie des signaux mesurables qui précèdent les mouvements de prix sur les skins CS2. Une thèse de 2025 portant sur 640 145 observations journalières confirme que les features de prix relatifs (moyennes mobiles, écarts), de supply, de statut collection et d'événements calendaires sont les prédicteurs les plus efficaces — avec des modèles XGBoost atteignant un R² ~0.50 sur 7 jours. Ces signaux sont intégrés en deux niveaux : règles déterministes (MVP/V1) et modèle ML (V3).
+
+**Ce que le PriceSignalEngine apporte vs les détections existantes :**
+
+| Détection existante | Scope | PriceSignalEngine |
+|---------------------|-------|-------------------|
+| `detect_recipe_velocity` | Inputs en hausse (opportunité se referme) | Outputs en hausse (opportunité s'améliore) |
+| `detect_pump` | Manipulation coordonnée sur outputs | Momentum organique multi-signaux |
+| `high_volatility` flag | Variation 24h brutale | Tendance structurelle 7j/30j/90j |
+
+---
+
+#### Les 9 signaux identifiés — classés par fiabilité
+
+| # | Signal | Type | Fiabilité | Source |
+|---|--------|------|-----------|--------|
+| S1 | Collection inactive (plus dans le pool de drop) | Structurel long terme | ⭐⭐⭐⭐⭐ | Valve drop pool |
+| S2 | Tendance prix 7j/30j positive | Momentum court terme | ⭐⭐⭐⭐ | Skinport history |
+| S3 | Accélération du volume (hype naissante) | Momentum précoce | ⭐⭐⭐ | Skinport history |
+| S4 | Pump score > 17 (supply limitée + prix bas) | Manipulation détectable | ⭐⭐⭐ | Skinport items |
+| S5 | Saisonnalité calendaire (Steam Sales, Majors) | Cyclique prévisible | ⭐⭐⭐ | Calendrier |
+| S6 | Corrélation inter-skins (hausse collection voisine) | Propagation | ⭐⭐ | Historique cross |
+| S7 | Divergence cross-plateforme (gap Skinport/BUFF163) | Anomalie d'arbitrage | ⭐⭐ | Multi-platform |
+| S8 | Méta arme (buff/nerf dans patch notes) | Événementiel | ⭐⭐ | Patch notes |
+| S9 | Usage pro/streamer | Événementiel imprévisible | ⭐ | Social monitoring |
+
+**Signal non modélisable :** le risque Valve (MAJ changeant les règles de trade-up) n'a produit aucun signal précurseur avant octobre 2025. L'avertissement systémique permanent reste la seule réponse possible.
+
+---
+
+#### PriceSignalEngine — implémentation
+
+```python
+from math import log, sqrt
+from datetime import date
+from enum import Enum
+
+class MomentumVerdict(str, Enum):
+    STRONG_UP   = "strong_up"    # score > 0.55 — conditions très favorables
+    MODERATE_UP = "moderate_up"  # score > 0.30
+    NEUTRAL     = "neutral"      # score 0.10–0.30
+    CAUTIOUS    = "cautious"     # score < 0.10 — conditions défavorables
+
+class PriceSignalEngine:
+    """
+    Analyse les signaux faibles pour chaque output d'une opportunité.
+    Produit un momentum_score de 0 à 1 intégré dans le Kontract Score.
+
+    Sources MVP : Skinport /v1/sales/history + ByMykel collections (active/inactive)
+    Sources V2+ : BUFF163 (cross-platform ratio) + patch notes Valve
+    """
+
+    # Calendrier saisonnier CS2 documenté
+    SEASONAL_CALENDAR = {
+        1:  ("post_winter_neutral",  0.00),
+        2:  ("neutral",              0.00),
+        3:  ("spring_recovery",     +0.05),  # Majors de printemps
+        4:  ("major_season",        +0.10),  # ESL / IEM Spring
+        5:  ("pre_summer",           0.00),
+        6:  ("steam_summer_sale",   +0.15),  # Hausse demande documentée
+        7:  ("post_summer_dip",     -0.05),  # Léger dip post-sale
+        8:  ("neutral",              0.00),
+        9:  ("back_to_school_dip",  -0.08),  # Baisse activité documentée
+        10: ("major_season",        +0.10),  # Majors d'automne
+        11: ("pre_winter",          +0.05),
+        12: ("steam_winter_sale",   +0.15),  # Hausse demande documentée
+    }
+
+    def compute_output_momentum(
+        self,
+        output_skin:  dict,   # données ByMykel (float_min, float_max, collection_id...)
+        collection:   dict,   # données ByMykel (active, release_date...)
+        history:      dict,   # Skinport /v1/sales/history pour cet output
+        items:        dict,   # Skinport /v1/items pour cet output
+        peer_skins:   list,   # autres skins de la même collection (corrélation)
+    ) -> dict:
+        """
+        Calcule le momentum score de l'output (0 = neutre, 1 = fort signal haussier).
+        Un score négatif est possible si plusieurs signaux baissiers se cumulent.
+        """
+        signals = {}
+        score   = 0.0
+
+        avg_7d  = history.get("last_7_days",  {}).get("avg",    0) or 0
+        avg_30d = history.get("last_30_days", {}).get("avg",    0) or 0
+        avg_90d = history.get("last_90_days", {}).get("avg",    0) or 0
+        vol_7d  = history.get("last_7_days",  {}).get("volume", 0) or 0
+        vol_30d = history.get("last_30_days", {}).get("volume", 0) or 0
+        supply  = items.get("quantity", 0)
+        price   = items.get("min_price") or avg_7d or 0
+
+        # ── S1 : Collection inactive → biais haussier structurel ─────────
+        # Les skins hors du pool de drop actif voient leur supply stagner
+        # tandis que la demande reste stable → pression haussière de long terme
+        collection_inactive = not collection.get("active", True)
+        signals["collection_inactive"] = collection_inactive
+        if collection_inactive:
+            score += 0.25
+
+        # ── S2 : Tendance prix 7j/30j et 30j/90j ────────────────────────
+        trend_7d_30d  = (avg_7d - avg_30d) / avg_30d  if avg_30d else 0
+        trend_30d_90d = (avg_30d - avg_90d) / avg_90d if avg_90d else 0
+        signals["trend_7d_30d"]  = round(trend_7d_30d,  3)
+        signals["trend_30d_90d"] = round(trend_30d_90d, 3)
+
+        if trend_7d_30d > 0.10:   score += 0.20   # +10% en 7j vs 30j
+        elif trend_7d_30d > 0.05: score += 0.10   # +5% → signal modéré
+        elif trend_7d_30d < -0.15: score -= 0.20  # en baisse forte → pénalité
+
+        if trend_30d_90d > 0.10:  score += 0.10   # tendance de fond haussière
+
+        # ── S3 : Accélération du volume (hype naissante) ─────────────────
+        avg_vol_weekly = vol_30d / 4.3 if vol_30d else 0
+        vol_accel      = (vol_7d / avg_vol_weekly - 1) if avg_vol_weekly > 0 else 0
+        signals["volume_acceleration"] = round(vol_accel, 3)
+        if vol_accel > 0.50:  score += 0.15   # volume 7j = 1.5× la moyenne → hype
+        elif vol_accel > 0.25: score += 0.07
+
+        # ── S4 : Pump score (supply faible + prix bas + collection inactive) ──
+        # Formule communautaire : log(price) / log(supply_fn) > 17
+        supply_fn = items.get("quantity_fn", supply)  # copies FN spécifiquement
+        if supply_fn > 1 and price > 0:
+            pump_score_val = log(price) / log(supply_fn)
+            signals["pump_score"] = round(pump_score_val, 2)
+            is_pump_candidate = (
+                pump_score_val > 17
+                and price < 150
+                and collection_inactive
+            )
+            signals["pump_candidate"] = is_pump_candidate
+            if is_pump_candidate:
+                # Attention : double tranchant
+                # Si le pump est déjà en cours → OUTPUT intéressant pour nos trade-ups
+                # Si notre INPUT est pump-candidate → pénalité via detect_pump()
+                score += 0.15
+        else:
+            signals["pump_score"]     = 0
+            signals["pump_candidate"] = False
+
+        # ── S5 : Saisonnalité calendaire ─────────────────────────────────
+        month = date.today().month
+        seasonal_label, seasonal_delta = self.SEASONAL_CALENDAR[month]
+        signals["seasonal_phase"] = seasonal_label
+        score += seasonal_delta
+
+        # ── S6 : Corrélation inter-skins (propagation collection) ────────
+        if peer_skins:
+            peer_trends = []
+            for peer in peer_skins:
+                p_avg_7d  = peer.get("avg_7d",  0) or 0
+                p_avg_30d = peer.get("avg_30d", 0) or 0
+                if p_avg_30d:
+                    peer_trends.append((p_avg_7d - p_avg_30d) / p_avg_30d)
+            if peer_trends:
+                avg_peer_trend = sum(peer_trends) / len(peer_trends)
+                signals["peer_collection_trend"] = round(avg_peer_trend, 3)
+                if avg_peer_trend > 0.08:
+                    score += 0.08   # la collection entière est en hausse
+
+        # ── S7 : Divergence cross-plateforme (V2 — BUFF163 requis) ───────
+        buff_ratio = items.get("buff_skinport_ratio")   # prix_buff / prix_skinport
+        if buff_ratio:
+            signals["cross_platform_ratio"] = round(buff_ratio, 3)
+            if buff_ratio < 0.70:
+                # BUFF163 beaucoup moins cher que Skinport → sur-offre ou
+                # arbitrageurs n'ont pas encore équilibré → signal baissier Skinport
+                score -= 0.10
+            elif buff_ratio > 0.90:
+                # Prix proches → marché équilibré → signal stable
+                pass
+
+        # ── Score final et verdict ────────────────────────────────────────
+        momentum_score = round(max(-0.5, min(1.0, score)), 3)
+
+        if momentum_score > 0.55:   verdict = MomentumVerdict.STRONG_UP
+        elif momentum_score > 0.30: verdict = MomentumVerdict.MODERATE_UP
+        elif momentum_score > 0.10: verdict = MomentumVerdict.NEUTRAL
+        else:                       verdict = MomentumVerdict.CAUTIOUS
+
+        return {
+            "momentum_score":    momentum_score,
+            "verdict":           verdict,
+            "signals":           signals,
+            "display_label":     {
+                MomentumVerdict.STRONG_UP:   "📈📈 fort signal haussier",
+                MomentumVerdict.MODERATE_UP: "📈 signal haussier",
+                MomentumVerdict.NEUTRAL:     "➡️  neutre",
+                MomentumVerdict.CAUTIOUS:    "⚠️  conditions défavorables",
+            }[verdict],
+        }
+```
+
+---
+
+#### Intégration dans le Kontract Score
+
+Le momentum score de l'output est converti en **multiplicateur** appliqué après le calcul du score de base. Il amplifie les bonnes opportunités au bon moment et pénalise les situations défavorables.
+
+```python
+def momentum_to_multiplier(momentum_score: float) -> float:
+    """
+    Convertit le momentum score en multiplicateur pour le Kontract Score.
+    Plage : 0.75 (très défavorable) → 1.30 (très favorable)
+
+    Calibrage :
+    - Neutre (0.0)  → 1.00 (aucun effet)
+    - Fort (+0.55)  → 1.30 (+30% sur le score)
+    - Défavorable (−0.30) → 0.80 (−20% sur le score)
+
+    La transformation est linéaire par morceaux pour éviter des effets
+    de seuil brusques.
+    """
+    if momentum_score >= 0:
+        # Zone positive : +1% de score par point de momentum × 0.55
+        return min(1.30, 1.0 + momentum_score * 0.545)
+    else:
+        # Zone négative : pénalité atténuée (asymétrie intentionnelle)
+        return max(0.75, 1.0 + momentum_score * 0.500)
+
+# Exemple :
+# momentum_score = 0.55 → multiplier = 1.30 → Kontract Score × 1.30
+# momentum_score = 0.00 → multiplier = 1.00 → Kontract Score inchangé
+# momentum_score = -0.30 → multiplier = 0.85 → Kontract Score × 0.85
+```
+
+---
+
+#### Calendrier saisonnier — données historiques
+
+| Période | Signal | Impact moyen documenté | Durée |
+|---------|--------|----------------------|-------|
+| Steam Summer Sale (juin) | Hausse demande + cas openings | +15% sur skins populaires | 2–3 semaines |
+| Steam Winter Sale (déc) | Idem | +10–20% | 2–3 semaines |
+| Majors CS2 (mars, oct–nov) | Hausse stickers + skins teams | +20–30% sur skins liés | 1–2 semaines |
+| Rentrée scolaire (sept) | Baisse activité joueurs | −5 à −10% | 3–4 semaines |
+| Nouvelle case (variable) | Hausse supply → baisse inputs | −5 à −15% sur skins similaires | 1–2 semaines |
+| Post-MAJ Valve (variable) | Choc volatilité | ±30% en 24h | Imprévisible |
+
+> **Attention** : la saisonnalité représente un facteur d'amplification modéré (+/−15% max). Elle ne justifie pas à elle seule l'entrée ou la sortie d'une opportunité. Elle doit être combinée avec les autres signaux.
+
+---
+
+#### Modèle ML — V3 (XGBoost featurisé)
+
+La recherche académique confirme que XGBoost avec features explicites surpasse les modèles LSTM sur ce marché. Features recommandées pour la V3 :
+
+```python
+FEATURES_XGBOOST_V3 = [
+    # Prix relatifs (les plus prédictifs selon la thèse 2025)
+    "price_vs_ma7",           # prix_actuel / MA7
+    "price_vs_ma30",          # prix_actuel / MA30
+    "price_vs_ma90",
+    "price_deviation_3sigma", # (prix - MA30) / std30 — outlier score
+
+    # Supply / structure (seconds en importance)
+    "supply_total",           # quantité disponible toutes conditions
+    "supply_fn_ratio",        # ratio FN / total
+    "collection_active_bool",
+    "case_age_days",          # ancienneté de la collection en jours
+
+    # Volume
+    "vol_accel_7d_30d",       # vol_7j / (vol_30j/4.3) - 1
+    "vol_7d_30d_ratio",
+
+    # Événements (one-hot encoding)
+    "is_major_week",          # bool
+    "is_steam_sale_period",   # bool
+    "is_back_to_school",      # bool
+    "days_since_last_update", # int
+
+    # Corrélations marché
+    "market_cap_7d_trend",    # tendance macro CSMarketCap
+    "collection_avg_trend_7d",
+    "cross_platform_ratio",   # ratio BUFF163 / Skinport (V3, BUFF requis)
+]
+
+TARGET = "price_change_7d_pct"   # régression : variation % à 7 jours
+# Alternative classification : hausse > 5% dans les 7j (binaire)
+```
+
+> **Scope** : le modèle XGBoost est hors scope MVP et V1. Il nécessite un historique de prix d'au moins 6 mois (disponible via SteamAnalyst API ou accumulation interne) et BUFF163 pour le ratio cross-plateforme. Prévu en V3 quand la base de données interne est suffisamment riche.
+
+---
+
 ### 4.8 Module Portfolio — Gestion du portefeuille de trade-ups
 
 #### Vue d'ensemble
@@ -2145,6 +2504,77 @@ La stratégie portefeuille consiste à gérer **plusieurs trade-ups en parallèl
 
 ---
 
+#### Définition d'un slot
+
+Un **slot** = un trade-up en cours d'acquisition. C'est simplement un panier d'inputs actif.
+
+```
+Slot 1 → Panier FAMAS REM → Fever Dream     (3/10 inputs achetés)
+Slot 2 → Panier AK Redline → Asiimov        (7/10 inputs achetés)
+Slot 3 → Panier USP Cortex → Black Tie      (10/10 → prêt à exécuter)
+Slot 4 → vide
+Slot 5 → vide
+→ Slots occupés : 3 | Slots libres : 2
+```
+
+Quand un panier est exécuté dans CS2 et l'output reçu, le slot se **libère** immédiatement — disponible pour un nouveau trade-up.
+
+**Il n'y a pas de limite technique** imposée par Valve ou Skinport. Le nombre de slots est un paramètre de configuration contraint par deux facteurs réels : le capital disponible et la capacité d'attention humaine.
+
+---
+
+#### Nombre de slots selon le capital — table de référence
+
+| Capital total | Max engagé (30%) | Coût moyen inputs | Slots max capital | Slots recommandés |
+|--------------|-----------------|------------------|------------------|------------------|
+| 100€ | 30€ | 30€ | 1 | 1 |
+| 200€ | 60€ | 40€ | 1 | 1 |
+| 500€ | 150€ | 50€ | 3 | 2–3 |
+| 500€ | 150€ | 80€ | 1 | 1–2 |
+| 1 000€ | 300€ | 60€ | 5 | 3–5 |
+| 2 000€ | 600€ | 80€ | 7 | 5 |
+| 5 000€+ | 1 500€ | 100€ | 10+ | 5–7 |
+
+> **Plafond humain** : au-delà de 5–7 slots simultanés, la gestion des alertes et des achats devient chronophage pour un trader individuel. Même avec un capital suffisant, la spec recommande de ne pas dépasser 5 slots en MVP.
+
+---
+
+#### Calcul automatique du nombre de slots optimal
+
+```python
+def compute_optimal_slots(
+    bankroll:         float,
+    avg_input_cost:   float,   # coût moyen d'un panier d'inputs (estimé sur les derniers trades)
+    human_cap:        int = 5, # plafond humain — configurable
+) -> dict:
+    """
+    Calcule le nombre de slots adapté au capital et au profil utilisateur.
+    Retourne le nombre optimal ET la répartition du capital par slot.
+    """
+    capital_dispo  = bankroll * 0.30          # max 30% engagé
+    max_par_slot   = bankroll * 0.20          # max 20% par trade-up
+    per_slot       = min(avg_input_cost, max_par_slot)
+    slots_capital  = int(capital_dispo / per_slot) if per_slot > 0 else 1
+    slots_optimal  = min(slots_capital, human_cap)
+
+    return {
+        "slots_optimal":     max(1, slots_optimal),
+        "capital_par_slot":  round(per_slot, 2),
+        "capital_total_max": round(per_slot * slots_optimal, 2),
+        "capital_reserve":   round(bankroll - per_slot * slots_optimal, 2),
+        "ratio_engage":      round(per_slot * slots_optimal / bankroll, 2),
+    }
+
+# Exemples :
+# compute_optimal_slots(200,  40) → slots=1, capital/slot=40€, réserve=160€
+# compute_optimal_slots(500,  50) → slots=3, capital/slot=50€, réserve=350€
+# compute_optimal_slots(500,  80) → slots=1, capital/slot=80€, réserve=420€
+# compute_optimal_slots(1000, 60) → slots=5, capital/slot=60€, réserve=700€
+# compute_optimal_slots(2000, 80) → slots=5, capital/slot=80€, réserve=1600€
+```
+
+---
+
 #### Configuration portefeuille — une seule fois
 
 ```python
@@ -2152,7 +2582,9 @@ PORTFOLIO_CONFIG = {
     "bankroll":            500.0,   # budget total €
     "max_pct_bankroll":    0.30,    # jamais > 30% engagé simultanément
     "max_pct_per_tradeup": 0.20,    # max 20% du budget par trade-up
-    "max_simultaneous":    5,       # nombre max de paniers actifs
+    "max_simultaneous":    5,       # plafond humain — indépendant du capital
+    # max_simultaneous est le plafond absolu. Le nombre réel de slots actifs
+    # est ensuite limité par le capital via compute_optimal_slots().
     "min_roi":             0.12,    # ROI minimum 12%
     "min_kontract_score":  8.0,     # seuil Kontract Score
     "float_crafting":      False,   # activé en V2
@@ -2160,10 +2592,55 @@ PORTFOLIO_CONFIG = {
     "source_vente":        "skinport",
 }
 
-# Dérivés calculés automatiquement
-max_capital_engaged  = PORTFOLIO_CONFIG["bankroll"] * PORTFOLIO_CONFIG["max_pct_bankroll"]
+# Dérivés calculés automatiquement au démarrage
+slots_config         = compute_optimal_slots(
+                           PORTFOLIO_CONFIG["bankroll"],
+                           avg_input_cost=60.0   # estimé ou saisi par l'utilisateur
+                       )
+max_capital_engaged  = slots_config["capital_total_max"]
 max_per_tradeup      = PORTFOLIO_CONFIG["bankroll"] * PORTFOLIO_CONFIG["max_pct_per_tradeup"]
 ```
+
+---
+
+#### Signification de "slots libres" dans la décision hold/sell
+
+```
+Slots libres = max_simultaneous - len(active_baskets)
+
+Slots libres = 0 → tous les paniers sont actifs
+               → le capital restant NE PEUT PAS être réinvesti immédiatement
+               → garder l'output en attente ne coûte rien en opportunité
+               → seuil hold très bas → HOLD recommandé si momentum > 0.30
+
+Slots libres ≥ 1 → au moins un slot disponible
+               → du capital pourrait financer un nouveau panier
+               → garder l'output bloque ce capital
+               → seuil hold élevé → SELL recommandé sauf signal très fort
+```
+
+**Exemple avec 500€ / 3 slots calculés :**
+
+```
+Slot 1 → panier 50€ en cours
+Slot 2 → panier 50€ en cours
+Slot 3 → vide  ← 1 slot libre, ~50€ disponibles
+
+Situation A : tu exécutes le slot 2 → slot 2 se libère → 2 slots libres
+  → SELL NOW recommandé (coût opportunité sur 2 slots)
+
+Situation B : tu exécutes le slot 2 pendant que le slot 1 vient d'ouvrir
+  → même résultat : 2 slots libres → SELL NOW
+
+Situation C : les 3 slots sont pleins ET tu exécutes pendant le hold
+  → output reçu mais les 3 slots sont déjà ré-ouverts → SELL NOW
+
+Situation D : 3 slots pleins, aucun nouveau trade-up dans le scanner > seuil
+  → slots libres resteront libres → capital de toute façon inactif
+  → HOLD recommandé si momentum > 0.30
+```
+
+---
 
 ---
 
@@ -2174,7 +2651,7 @@ class PortfolioEngine:
     """
     Moteur de portefeuille — tourne en continu.
     Cycle complet toutes les 5 minutes.
-    WebSocket Skinport en temps réel pour les alertes d'achat.
+    WebSocket Skinport en temps réel pour les alertes d'achat, ActionRecommender 4.13 (plan d'actions Telegram avec items exacts + liens directs).
     """
 
     async def run_cycle(self):
@@ -2537,6 +3014,7 @@ async def record_execution(basket_id: str, output_name: str = None,
 | Pré-remplissage /executed | ✗ | ✓ auto | ✓ auto |
 | Enregistrement P&L | Manuel | 1 clic confirm | 1 clic confirm |
 | Vérification précision float | ✗ | ✓ auto | ✓ auto |
+| Décision hold vs sell (OutputSellEngine) | ✓ recommandation | ✓ + stop-loss auto | ✓ + ML prédiction |
 
 #### Schéma BDD — P&L enrichi
 
@@ -2548,7 +3026,7 @@ pnl_records :
     output_received  TEXT,
     output_float     DECIMAL(10,8),
     output_wear      TEXT,              -- FN / MW / FT / WW / BS
-    sell_price       DECIMAL(10,2),
+    sell_price       DECIMAL(10,2),     -- prix de vente réel final
     total_cost       DECIMAL(10,2),
     pnl_euros        DECIMAL(10,2),
     pnl_pct          DECIMAL(6,2),
@@ -2558,53 +3036,546 @@ pnl_records :
     float_delta      DECIMAL(10,8),    -- |float_réel - float_prédit|
     float_accurate   BOOLEAN,          -- delta <= 0.001
     detected_auto    BOOLEAN,          -- auto ou manuel
-    executed_at      TIMESTAMP
+    executed_at      TIMESTAMP,
+    -- Hold/Sell decision (OutputSellEngine)
+    sell_decision         TEXT,        -- "sell_now" | "hold_N_days"
+    sell_price_immediate  DECIMAL(10,2),-- prix au moment de la décision
+    actual_sell_price     DECIMAL(10,2),-- prix réel (peut être différé si hold)
+    actual_sell_date      TIMESTAMP,   -- date de vente réelle
+    hold_days_target      INTEGER,     -- nb jours de hold visés
+    hold_days_actual      INTEGER,     -- nb jours réellement attendus
+    hold_gain_realized    DECIMAL(6,2),-- actual_sell vs sell_immediate (%)
+    momentum_score_sell   DECIMAL(6,3),-- momentum au moment de la décision
+    expected_gain_pct     DECIMAL(6,2),-- gain espéré lors de la décision
+    hold_decision_quality TEXT         -- "correct"|"premature"|"too_long" (V2)
 ```
 
-### 4.10 Interface utilisateur — architecture des pages
+
+### 4.11 Module OutputSellEngine — décision hold vs vente immédiate
+
+#### Problème : vélocité du capital vs gain marginal
+
+Après l'exécution d'un trade-up, la question se pose : vendre immédiatement ou attendre si le prix de l'output semble devoir monter ? La réponse dépend d'un arbitrage mathématique précis entre le **gain d'attente espéré** et le **coût d'opportunité du capital immobilisé**.
+
+**Formule fondamentale :**
+
+```python
+# Le gain d'attente est rentable seulement si :
+# gain_espéré > roi_tradeup × (jours_attente / durée_cycle)
+
+# Exemple : ROI 18%, cycle 5 jours, attente 3 jours, gain espéré +8%
+# Seuil = 18% × (3/5) = 10.8%
+# Gain espéré 8% < 10.8% → NE PAS ATTENDRE
+
+# Contre-exemple avec slots pleins :
+# Si le portefeuille est saturé (slots libres = 0), le capital ne peut pas
+# être réinvesti de toute façon → seuil tombe à 0 → hold rationnel si
+# momentum > 0.30
+```
+
+**Conclusion clé** : le hold conditionnel (uniquement quand les slots sont pleins ET le signal momentum est fort) est la stratégie optimale. Le hold systématique est toujours sous-optimal à cause de la perte de vélocité du capital.
+
+> **Rappel** : un slot = un panier d'inputs actif. Le nombre de slots est calculé automatiquement selon le capital (`compute_optimal_slots()`). "Slots pleins" signifie que tous les paniers calculés sont actifs et que le capital disponible est déjà engagé — il n'y a rien à réinvestir immédiatement, donc garder l'output en attente est gratuit.
+
+---
+
+#### OutputSellEngine — implémentation
+
+```python
+class OutputSellEngine:
+    """
+    Décide quand vendre l'output d'un trade-up exécuté.
+    Intègre le momentum (PriceSignalEngine), la vélocité du capital,
+    et le risque Valve.
+    Appelé automatiquement après chaque détection d'output (V1).
+    """
+
+    MAX_HOLD_DAYS       = 7      # jamais au-delà — prédictibilité < 50%
+    MIN_MOMENTUM_HOLD   = 0.30   # seuil minimum pour envisager l'attente
+    GAIN_CALIBRATION    = 0.18   # gain espéré par point momentum × nb_jours
+    STOP_LOSS_PCT       = 0.05   # -5% → vente forcée pendant le hold
+
+    def decide(
+        self,
+        output_skin:      dict,   # skin reçu (market_hash_name, vol_7d, etc.)
+        execution_price:  float,  # prix de vente actuel sur Skinport
+        roi_tradeup:      float,  # ROI du trade-up (ex: 0.18 pour +18%)
+        cycle_days:       float,  # durée totale du cycle d'achat + exécution
+        portfolio:        dict,   # état du portefeuille {active_baskets, max_slots}
+        momentum:         dict,   # résultat PriceSignalEngine output
+        market_context:   dict,   # {days_since_valve_update, ...}
+    ) -> dict:
+
+        free_slots        = portfolio["max_slots"] - len(portfolio["active_baskets"])
+        mom_score         = momentum["momentum_score"]
+        days_since_update = market_context.get("days_since_valve_update", 30)
+
+        # ── Règles éliminatoires → vente immédiate ────────────────────────
+        if mom_score < self.MIN_MOMENTUM_HOLD:
+            return self._sell(execution_price, "momentum_trop_faible")
+
+        if days_since_update < 7:
+            return self._sell(execution_price, "risque_valve_eleve_post_update")
+
+        if output_skin.get("vol_7d", 0) < 10:
+            return self._sell(execution_price, "output_peu_liquide")
+
+        # ── Trouver l'horizon de hold optimal ─────────────────────────────
+        for hold_days in [1, 2, 3, 5, 7]:
+            expected_gain  = mom_score * self.GAIN_CALIBRATION * hold_days
+
+            # Seuil de base : gain minimum pour justifier l'attente
+            breakeven = roi_tradeup * (hold_days / max(cycle_days, 1))
+
+            # Coût d'opportunité si des slots sont libres
+            # (capital qui pourrait financer un nouveau trade-up)
+            if free_slots > 0:
+                # On estime à 50% la probabilité de trouver une opportunité
+                opp_cost = (roi_tradeup / cycle_days) * hold_days * free_slots * 0.5
+            else:
+                # Slots pleins → capital de toute façon immobilisé
+                opp_cost = 0
+
+            total_threshold = breakeven + opp_cost
+
+            if expected_gain > total_threshold:
+                stop_loss_price = execution_price * (1 - self.STOP_LOSS_PCT)
+                return {
+                    "decision":        "hold",
+                    "hold_days":       hold_days,
+                    "expected_gain":   round(expected_gain * 100, 1),
+                    "threshold":       round(total_threshold * 100, 1),
+                    "reason":          (
+                        f"gain_{expected_gain*100:.1f}% > "
+                        f"seuil_{total_threshold*100:.1f}% "
+                        f"(slots_libres={free_slots})"
+                    ),
+                    "stop_loss":       round(stop_loss_price, 2),
+                    "review_at_days":  hold_days,
+                }
+
+        return self._sell(execution_price, "aucun_horizon_rentable")
+
+    def _sell(self, price: float, reason: str) -> dict:
+        return {
+            "decision":   "sell_now",
+            "sell_price": price,
+            "reason":     reason,
+        }
+
+    def check_stop_loss(
+        self,
+        current_price: float,
+        entry_price:   float,  # prix au moment de la décision de hold
+        hold_days:     int,
+        days_elapsed:  int,
+        momentum:      dict,
+    ) -> tuple[bool, str]:
+        """
+        Réévaluation périodique pendant le hold.
+        Retourne (True, raison) si vente forcée recommandée.
+        Appelé toutes les 5 min via APScheduler pendant la période de hold.
+        """
+        if current_price < entry_price * (1 - self.STOP_LOSS_PCT):
+            return True, f"stop_loss_-{self.STOP_LOSS_PCT*100:.0f}%"
+
+        if momentum["momentum_score"] < 0.15:
+            return True, "momentum_disparu"
+
+        if days_elapsed >= hold_days:
+            return True, "duree_max_atteinte"
+
+        if momentum.get("signals", {}).get("velocity_alert"):
+            # Les inputs du trade-up suivant montent → réinvestir maintenant
+            return True, "recipe_velocity_detectee"
+
+        return False, "hold_continue"
+```
+
+---
+
+#### Pipeline complet post-exécution
+
+```python
+async def handle_output_received(
+    basket:         dict,
+    output_item:    dict,
+    float_val:      float,
+    portfolio:      dict,
+    prices:         dict,
+    history:        dict,
+    collections_db: dict,
+):
+    """
+    Pipeline déclenché automatiquement après détection de l'output.
+    Enchaîne : P&L immédiat → momentum → décision hold/sell → notification.
+    """
+    # 1. Calculer le P&L immédiat
+    sell_price  = prices[output_item["market_hash_name"]]["min_price"]
+    total_cost  = basket.state.total_spent
+    pnl_imm     = sell_price * (1 - FEES["skinport"]["seller"]) - total_cost
+    roi_imm     = pnl_imm / total_cost
+
+    # 2. Calcul du momentum output
+    collection  = collections_db[output_item["collection_id"]]
+    output_hist = history.get(output_item["market_hash_name"], {})
+    output_items = prices.get(output_item["market_hash_name"], {})
+
+    momentum = PriceSignalEngine().compute_output_momentum(
+        output_skin  = output_item,
+        collection   = collection,
+        history      = output_hist,
+        items        = output_items,
+        peer_skins   = get_peer_skins(collection, output_item),
+    )
+
+    # 3. Décision hold vs vente
+    engine   = OutputSellEngine()
+    decision = engine.decide(
+        output_skin     = output_item,
+        execution_price = sell_price,
+        roi_tradeup     = roi_imm,
+        cycle_days      = basket.cycle_days,
+        portfolio       = portfolio,
+        momentum        = momentum,
+        market_context  = {"days_since_valve_update": get_days_since_update()},
+    )
+
+    # 4. Enregistrer la décision en BDD
+    await db.update_pnl_record(basket["id"], {
+        "sell_decision":    decision["decision"],
+        "sell_price_imm":   sell_price,
+        "hold_days_target": decision.get("hold_days", 0),
+        "momentum_score":   momentum["momentum_score"],
+        "expected_gain":    decision.get("expected_gain", 0),
+    })
+
+    # 5. Si hold → programmer la réévaluation périodique
+    if decision["decision"] == "hold":
+        await schedule_hold_monitoring(basket["id"], decision["hold_days"], engine)
+
+    # 6. Notification Telegram
+    await notify_sell_decision(basket, output_item, float_val,
+                                pnl_imm, roi_imm, momentum, decision)
+```
+
+---
+
+#### Notification Telegram — décision hold/sell
+
+```
+✅ Output détecté — AWP Fever Dream FT (float 0.247)
+
+Coût inputs   : 19.00€
+Valeur actuel : 22.40€
+P&L immédiat  : +3.40€ (+17.9%)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANALYSE HOLD vs VENTE
+
+Momentum output : 📈 +0.52
+  → Collection inactive depuis 18 mois
+  → Tendance prix +8% (7j/30j)
+  → Steam Summer Sale actif (+15% saisonnier)
+
+Slots disponibles : 1/5 libres (coût opportunité actif)
+Gain espéré hold 3j : +7.5%
+Seuil rentabilité  : +10.8%  ← gain < seuil
+
+💡 RECOMMANDATION : VENDRE MAINTENANT
+   (Si tous les slots étaient pleins → HOLD 3j recommandé)
+
+[✅ VENDRE] → https://skinport.com/item/...
+[⏳ HOLD 3j] → stop-loss à 21.28€ (-5%)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Si l'utilisateur choisit HOLD et que le stop-loss se déclenche :
+
+```
+⛔ Stop-loss déclenché — AWP Fever Dream FT
+Prix actuel : 21.20€ (−5.4% vs entrée 22.40€)
+→ Vente recommandée immédiatement pour limiter la perte
+→ P&L final estimé : +2.00€ (+10.5%)
+
+[VENDRE MAINTENANT]
+```
+
+---
+
+#### Commandes Telegram
+
+```
+/sell <basket_id>              → vente immédiate au prix actuel
+/hold <basket_id> <nb_jours>   → activer hold manuel avec stop-loss auto
+/hold_status                   → voir tous les outputs en attente
+```
+
+---
+
+#### Schéma BDD — colonnes additionnelles pnl_records
+
+```sql
+-- Colonnes supplémentaires ajoutées à pnl_records pour le tracking hold/sell
+sell_decision         TEXT,         -- "sell_now" | "hold_N_days"
+sell_price_immediate  DECIMAL(10,2),-- prix au moment de la décision
+actual_sell_price     DECIMAL(10,2),-- prix de vente réel (peut être différé)
+actual_sell_date      TIMESTAMP,    -- date de vente réelle
+hold_days_target      INTEGER,      -- nb jours de hold visés (si hold)
+hold_days_actual      INTEGER,      -- nb jours réellement attendus
+hold_gain_realized    DECIMAL(6,2), -- actual_sell - sell_immediate (en %)
+momentum_score_sell   DECIMAL(6,3), -- momentum au moment de la décision
+expected_gain_pct     DECIMAL(6,2), -- gain espéré au moment de la décision
+hold_decision_quality TEXT          -- "correct" | "premature" | "too_long"
+                                    -- calculé rétrospectivement (V2)
+```
+
+---
+
+#### Tableau automatisation par phase — hold/sell
+
+| Étape | MVP | V1 | V2 |
+|-------|-----|----|----|
+| Calcul P&L immédiat | ✓ | ✓ | ✓ |
+| Momentum output (PriceSignalEngine) | ✓ | ✓ | ✓ |
+| Décision hold/sell automatique | ✓ | ✓ | ✓ |
+| Notification Telegram avec recommandation | ✓ | ✓ | ✓ |
+| Monitoring stop-loss pendant hold | ✗ | ✓ polling 5min | ✓ |
+| Réévaluation momentum pendant hold | ✗ | ✓ | ✓ |
+| Qualité décision rétroactive | ✗ | ✗ | ✓ auto |
+| Modèle ML prédiction gain hold | ✗ | ✗ | ✓ XGBoost V3 |
+
+### 4.14 Interface utilisateur — architecture des pages
 
 L'interface MVP (Streamlit) est organisée en **4 pages** accessibles via une sidebar. Chaque page correspond à une phase du workflow utilisateur.
 
 ---
 
-#### Page 1 — Scanner (page d'accueil)
+#### Page 0 — Plan d'action (page d'accueil)
 
-Vue en temps réel de toutes les opportunités qualifiées, triées par Kontract Score décroissant.
+C'est le **cockpit principal** de Kontract.gg. Elle agrège toutes les actions concrètes du moment, triées par urgence. L'utilisateur n'a aucune décision à prendre — juste cliquer sur les liens.
+
+Navigation mise à jour :
+```
+Sidebar : 📋 Plan  |  🔍 Scanner  |  📦 Portefeuille  |  🔢 Calculateur  |  📊 P&L
+```
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  🎯 KONTRACT.GG          Scanner  Portfolio  Portefeuille  P&L      │
+│ 🎯 KONTRACT.GG   Plan  Scanner  Portefeuille  Calculateur  P&L      │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  FILTRES RAPIDES                                                      │
-│  ROI min [10%▼]  Budget max [100€▼]  Pool max [5▼]  Score min [5▼]  │
+│                                                                      │
+│  📋 PLAN D'ACTION — Vendredi 20 mars · 14h32                        │
+│  Mis à jour il y a 2min | 3 slots actifs / 3 | Capital 423/500€     │
+│  ⚠️  Risque Valve permanent — toute MAJ peut invalider les actions   │
+│                                                                      │
+│  ┌── 🔴 URGENT (2) ───────────────────────────────────────────┐     │
+│  │                                                             │     │
+│  │ [1] 🛒 ACHETER MAINTENANT                                   │     │
+│  │     FAMAS | Rapid Eye Movement (Minimal Wear)               │     │
+│  │     Float 0.1430 · Score listing 84/100                     │     │
+│  │     Prix 7.93€  (−17% vs médiane)  ·  Skinport              │     │
+│  │     Panier : FAMAS REM→Fever Dream FN  ·  Input 3/10        │     │
+│  │     ⏱ Expire ~2h (vol 8 ventes/j)                          │     │
+│  │     [🛒 ACHETER] → skinport.com/item/.../6934215            │     │
+│  │                                                             │     │
+│  │ [2] 🛒 ACHETER MAINTENANT                                   │     │
+│  │     FAMAS | Rapid Eye Movement (Minimal Wear)               │     │
+│  │     Float 0.1460 · Score 79/100 · 7.95€ (−17%)             │     │
+│  │     Panier : idem  ·  Input 4/10 après cet achat            │     │
+│  │     [🛒 ACHETER] → skinport.com/item/.../6934221            │     │
+│  │                                                             │     │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌── 🟡 CE SOIR (3) ──────────────────────────────────────────┐     │
+│  │                                                             │     │
+│  │ [3] 👁 SURVEILLER — acheter si prix ≤ 8.10€                │     │
+│  │     FAMAS | Rapid Eye Movement (Minimal Wear)               │     │
+│  │     Prix actuel 8.39€  ·  Cible : < 8.10€                  │     │
+│  │     Panier : FAMAS REM→Fever Dream FN  ·  Input 5/10        │     │
+│  │     [👁 SURVEILLER] → skinport.com/market/...               │     │
+│  │                                                             │     │
+│  │ [4] 💰 VENDRE MAINTENANT                                    │     │
+│  │     AWP | Fever Dream (Field-Tested)  ·  float 0.247        │     │
+│  │     Prix actuel 22.40€ · Momentum 📈 mais slot libre        │     │
+│  │     Raison : gain espéré +7.5% < seuil +10.8%              │     │
+│  │     [💰 VENDRE] → skinport.com/sell  [⏳ HOLD 3j]          │     │
+│  │                                                             │     │
+│  │ [5] ✅ EXÉCUTER LE TRADE-UP DANS CS2                        │     │
+│  │     M4A4 Howl input → AWP Dragon Lore BS  ·  10/10 ✓        │     │
+│  │     Float prédit 0.521 → Battle-Scarred                     │     │
+│  │     [📋 VOIR INSTRUCTIONS CS2]                              │     │
+│  │                                                             │     │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌── 🟠 ATTENTION (1) ────────────────────────────────────────┐     │
+│  │                                                             │     │
+│  │ [6] ⚠️  ABANDON RECOMMANDÉ                                  │     │
+│  │     Glock | Bullet Rain → Dragon King                       │     │
+│  │     Score 8.3 (était 14.2)  ·  4/10 inputs achetés         │     │
+│  │     Perte abandon −4.20€  ·  EV restante +2.80€            │     │
+│  │     [❌ ABANDONNER et revendre] [↩️ Ignorer]               │     │
+│  │                                                             │     │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  ┌── 🟢 CETTE SEMAINE (1) ────────────────────────────────────┐     │
+│  │                                                             │     │
+│  │ [7] 🆕 NOUVELLE OPPORTUNITÉ — 1 slot se libère bientôt     │     │
+│  │     USP Cortex → Black Tie  ·  Score 14.1  ·  ROI +24%     │     │
+│  │     Momentum ⚠️ −8% (rentrée scolaire)                     │     │
+│  │     Premier input à acheter :                               │     │
+│  │     USP-S | Cortex (FT) float=0.201 · 8.20€ · score 73     │     │
+│  │     [🛒 OUVRIR CE PANIER] → skinport.com/item/.../7890123   │     │
+│  │                                                             │     │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  [🔄 Rafraîchir]  [⚙️ Préférences]  Actions expirées auj. : 3       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Comportements dynamiques :**
+- Rafraîchissement automatique toutes les 5 min (APScheduler)
+- Alerte WebSocket instantanée pour les actions urgentes (score ≥ 80) — badge rouge sur l'onglet "Plan"
+- Les actions expirées (listing vendu, hold terminé) disparaissent automatiquement
+- La priorité URGENT n'apparaît que si des actions sont disponibles maintenant
+
+**Vue détail — Exécution CS2 (clic sur [📋 VOIR INSTRUCTIONS CS2]) :**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ✅ PANIER PRÊT — M4A4 Howl in → AWP Dragon Lore BS                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  10/10 inputs dans l'inventaire ✓                                   │
+│  Float output prédit : 0.521 → Battle-Scarred                       │
+│  EV nette estimée    : +14.20€  (+18% ROI)                          │
+│                                                                      │
+│  INSTRUCTIONS CS2 :                                                  │
+│  1. Ouvrir CS2 → Inventaire → onglet "Contrats"                     │
+│  2. Glisser ces 10 items dans les emplacements :                     │
+│     ✓ M4A4|Howl FT float=0.289  assetid:24958657824                 │
+│     ✓ M4A4|Howl FT float=0.301  assetid:24958657901                 │
+│     ... (10 lignes)                                                  │
+│  3. Vérifier float CS2 ≈ 0.521                                      │
+│  4. Cliquer "Envoyer le contrat"                                     │
+│                                                                      │
+│  [✅ J'AI EXÉCUTÉ → confirmer /executed auto]                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Vue détail — Abandon (clic sur [❌ ABANDONNER]) :**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  ⚠️  ABANDON — Glock | Bullet Rain → Dragon King                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  4/10 inputs achetés  ·  38€ investis                               │
+│  Perte si abandon : −4.20€  |  EV si continue : +2.80€             │
+│  → Abandonner économise 1.40€ vs continuer                          │
+│                                                                      │
+│  REVENDRE CES 4 ITEMS :                                              │
+│  [1] Glock|Bullet Rain MW float=0.124  9.20€  → skinport.com/...    │
+│  [2] Glock|Bullet Rain MW float=0.139  9.15€  → skinport.com/...    │
+│  [3] Glock|Bullet Rain MW float=0.131  9.20€  → skinport.com/...    │
+│  [4] Glock|Bullet Rain MW float=0.147  9.10€  → skinport.com/...    │
+│  Total estimé revente : 33.80€  (perte nette : −4.20€)             │
+│                                                                      │
+│  [❌ CONFIRMER ABANDON]   [↩️ IGNORER et continuer]                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Vue détail — Stratégie fillers (clic sur [🛒 OUVRIR CE PANIER]) :**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  🆕 OUVRIR — FAMAS REM → AWP Fever Dream FN  (stratégie fillers 7+3)│
+├─────────────────────────────────────────────────────────────────────┤
+│  Kontract Score 36.4  ·  ROI +18%  ·  Budget estimé 63.51€         │
+│  Momentum 📈📈 +57% (collection inactive + Steam Summer Sale)       │
+│  Float output prédit : Battle-Scarred (avg_norm ≈ 0.87)             │
+│                                                                      │
+│  INPUTS COLLECTION CIBLE (7×)                                       │
+│  ┌────────────────────────────────────────────────────────────┐     │
+│  │ # │ Item                        │Float │Score│ Prix  │ Lien│     │
+│  │ 1 │ FAMAS|REM (MW)              │0.143 │ 84  │ 7.93€ │ [🛒]│     │
+│  │ 2 │ FAMAS|REM (MW)              │0.146 │ 79  │ 7.95€ │ [🛒]│     │
+│  │ 3 │ FAMAS|REM (MW)              │0.137 │ 71  │ 8.00€ │ [🛒]│     │
+│  │ 4 │ FAMAS|REM (MW)              │0.144 │ 69  │ 8.00€ │ [🛒]│     │
+│  │ 5 │ FAMAS|REM (MW)              │0.139 │ 65  │ 8.32€ │ [🛒]│     │
+│  │ 6 │ FAMAS|REM (MW)              │0.125 │ 63  │ 8.41€ │ [🛒]│     │
+│  │ 7 │ FAMAS|REM (MW)              │0.132 │ 61  │ 8.39€ │ [🛒]│     │
+│  └────────────────────────────────────────────────────────────┘     │
+│                                                                      │
+│  FILLERS (3×) — collection Genesis, float range max 0.00–1.00       │
+│  ┌────────────────────────────────────────────────────────────┐     │
+│  │ # │ Item                        │Float │Score│ Prix  │ Lien│     │
+│  │ 8 │ MP5-SD|Focus (MW)           │0.112 │ 72  │ 0.84€ │ [🛒]│     │
+│  │ 9 │ MP5-SD|Focus (MW)           │0.098 │ 70  │ 0.86€ │ [🛒]│     │
+│  │10 │ MP5-SD|Focus (MW)           │0.124 │ 68  │ 0.89€ │ [🛒]│     │
+│  └────────────────────────────────────────────────────────────┘     │
+│                                                                      │
+│  Coût total estimé : 63.51€  ·  EV nette : +11.43€  ·  ROI : +18%  │
+│  [🛒 TOUT ACHETER EN ORDRE] (liens s'ouvrent séquentiellement)       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Page 1 — Scanner (opportunités)
+
+Vue de toutes les opportunités qualifiées, triées par Kontract Score décroissant. Disponible pour les utilisateurs qui veulent explorer au-delà du plan d'action suggéré.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  🔍 SCANNER   Plan  Scanner  Portefeuille  Calculateur  P&L          │
+├─────────────────────────────────────────────────────────────────────┤
+│  FILTRES                                                              │
+│  ROI min [10%▼]  Budget [100€▼]  Pool max [5▼]  Score min [5▼]      │
 │  [✓] Exclure trending_down  [ ] Exclure haute volatilité             │
+│  Stratégie : [Toutes ▼]  Source achat : [Skinport ▼]                 │
 │                                                                       │
-│  42 opportunités trouvées — Mis à jour il y a 2min                   │
-│  ⚠️ Risque Valve : toute MAJ peut invalider les opportunités          │
+│  42 opportunités  ·  Mis à jour il y a 2min                          │
+│  ⚠️  Risque Valve permanent                                           │
 │                                                                       │
-│  Score │ Trade-up                    │ROI  │Pool│Vol/j│Inputs│Action │
-│  ──────┼─────────────────────────────┼─────┼────┼─────┼──────┼────── │
-│  24.7  │ FAMAS REM → Fever Dream FN  │+18% │ 2  │ 38  │🟢 x40│ [+]  │
-│  21.3  │ AK Redline → Asiimov FT     │+22% │ 3  │ 95  │🟢 x80│ [+]  │
-│  18.9  │ M4A4 Howl in → Dragon       │+15% │ 2  │ 12  │🟡 x8 │ [+]  │
-│  ⚡16.2 │ USP Cortex → Black Tie      │+24% │ 4  │ 44  │🟢 x55│ [+]  │
-│  ...   │ ...                          │ ... │... │ ... │ ...  │ ... │
-│                                                                       │
-│  [▼ Voir détail] sur clic de ligne — décomposition complète          │
+│  Score │ Trade-up                   │ROI  │Pool│Vol/j│Inputs│Moment.│
+│  ──────┼────────────────────────────┼─────┼────┼─────┼──────┼─────  │
+│  36.4  │ FAMAS REM → Fever Dream FN │+18% │ 2  │ 38  │🟢 x40│📈📈+57%│
+│  28.1  │ AK Redline → Asiimov FT    │+22% │ 3  │ 95  │🟢 x80│📈 +30%│
+│  18.9  │ M4A4 Howl → Dragon         │+15% │ 2  │ 12  │🟡 x8 │➡️  +0%│
+│  ⚡14.1 │ USP Cortex → Black Tie     │+24% │ 4  │ 44  │🟢 x55│⚠️  -8%│
+│  ...                                                                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **⚡ = recipe velocity alert** (inputs en hausse rapide)
 
-Clic sur une ligne → panneau de détail latéral :
-- Décomposition EV par outcome avec probabilités
-- Floor ratio, win_prob, CV pondéré
-- Listings recommandés pour les inputs (top 3 avec score)
-- Lien direct vers chaque listing Skinport
-- Bouton "Ajouter au portefeuille"
+Clic sur une ligne → **panneau de détail latéral** :
 
----
+```
+┌── DÉTAIL OPPORTUNITÉ — FAMAS REM → AWP Fever Dream FN ──────────────┐
+│  Kontract Score : 36.4  ·  ROI : +18%  ·  Momentum : 📈📈 +57%      │
+│  EV nette : +9.20€  ·  Win prob : 85%  ·  Floor ratio : 42%         │
+│  Pool : 2 outcomes  ·  Cycle estimé : 5 jours                        │
+│                                                                       │
+│  OUTCOMES                                                             │
+│  AWP Fever Dream FN   12%  ·  42.00€  ·  vol 7j:15  ·  ✓ win        │
+│  AWP Fever Dream MW   88%  ·  18.00€  ·  vol 7j:38  ·  ✓ win        │
+│                                                                       │
+│  SIGNAUX MARCHÉ                                                       │
+│  Collection inactive ✓  ·  Trend +8%  ·  Steam Summer Sale actif     │
+│  Pump score : 14.2 (normal)  ·  Recipe velocity : stable ✓           │
+│                                                                       │
+│  TOP 3 LISTINGS INPUT — FAMAS | REM (Minimal Wear)                   │
+│  # │Score│ Float  │  Prix  │Saving│ Action                           │
+│  1 │ 84  │ 0.1430 │ 7.93€  │ −17% │ [🛒 Acheter]                    │
+│  2 │ 79  │ 0.1460 │ 7.95€  │ −17% │ [🛒 Acheter]                    │
+│  3 │ 71  │ 0.1370 │ 8.00€  │ −17% │ [🛒 Acheter]                    │
+│                                                                       │
+│  Kelly recommandé : 2.3% du bankroll  ·  Répétable : 8×              │
+│                                                                       │
+│  [➕ Ajouter au portefeuille]  [🔢 Ouvrir dans le calculateur]       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 
 #### Page 2 — Portefeuille (gestion des paniers actifs)
 
@@ -2612,17 +3583,19 @@ Vue en temps réel de tous les paniers en cours pour l'utilisateur.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  📦 PORTEFEUILLE          Scanner  Portfolio  Portefeuille  P&L      │
+│  📦 PORTEFEUILLE  Plan  Scanner  Portefeuille  Calculateur  P&L      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                       │
-│  Budget : 423€ / 1000€ engagé (42%)  ████████░░░░░░░░░░░░░          │
-│  Slots  : 4 / 5 actifs                                               │
+│  Capital : 423€ engagé / 500€ max (3 slots) ████████░░░░░░░░░░░░░    │
+│  Slots  : 3 / 3 actifs  ← tous pleins  |  0 slot libre               │
+│  (Chaque slot ≈ 80€ d'inputs | Capital réserve : 77€)                │
 │                                                                       │
 │  Score  │ Trade-up              │Panier │Budget│Statut   │Action     │
 │  ───────┼───────────────────────┼───────┼──────┼─────────┼─────────  │
 │  24.7   │ FAMAS → Fever Dream   │ 3/10  │ 24€  │🔄 achat │[Détail]  │
 │  21.3   │ AK → Asiimov FT       │ 7/10  │ 62€  │🔄 achat │[Détail]  │
 │  18.9   │ M4A4 → Dragon         │10/10  │ 98€  │✅ PRÊT  │[Exécuter]│
+│  15.2   │ FAMAS → Fever Dream   │Vendu  │  -   │⏳ HOLD 2j│ 22.40€  │[Vendre]  │
 │  ⚠️8.3  │ Glock → Bullet        │ 4/10  │ 38€  │⚠️ ↓score│[Abandon] │
 │                                                                       │
 │  ⚠️ Glock → Bullet : score passé 14.2 → 8.3 (-42%)                  │
@@ -2649,7 +3622,7 @@ Outil libre pour calculer l'EV d'une combinaison personnalisée.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  🔢 CALCULATEUR           Scanner  Portfolio  Portefeuille  P&L      │
+│  🔢 CALCULATEUR   Plan  Scanner  Portefeuille  Calculateur  P&L      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                       │
 │  MODE : [Standard ▼]  [Float crafting]  [Reverse (output → inputs)] │
@@ -2685,14 +3658,15 @@ Tableau de bord de performance long terme.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  📊 P&L & STATS           Scanner  Portfolio  Portefeuille  P&L      │
+│  📊 P&L & STATS   Plan  Scanner  Portefeuille  Calculateur  P&L      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                       │
 │  RÉSUMÉ                        30 derniers jours                     │
-│  ┌──────────┬──────────┬──────────┬──────────┐                       │
-│  │ +142.30€ │  78%     │ +16.2%   │  94%     │                       │
-│  │ P&L net  │ Win rate │ ROI moy  │ Préc. EV │                       │
-│  └──────────┴──────────┴──────────┴──────────┘                       │
+│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐            │
+│  │ +142.30€ │  78%     │ +16.2%   │  94%     │  4.2j    │            │
+│  │ P&L net  │ Win rate │ ROI moy  │ Préc. EV │ Cycle moy│            │
+│  └──────────┴──────────┴──────────┴──────────┴──────────┘            │
+│  Slots actifs : 3/3 | Vélocité capital : 87% (taux d'occupation)    │
 │                                                                       │
 │  COURBE P&L CUMULÉ ───────────────────────────────────────────       │
 │  200│                                          ╭──                   │
@@ -2721,10 +3695,1310 @@ Tableau de bord de performance long terme.
 
 | Page | MVP (Streamlit) | V1 | V2 (React) |
 |------|----------------|-----|------------|
+| **Plan d'action** | ✓ Page d'accueil + Telegram | ✓ + vues détail abandon/exécution | ✓ Push temps réel + badges |
 | Scanner | ✓ Complet | ✓ + filtres perso | ✓ UX améliorée |
 | Portefeuille | ✓ Basique (sync manuel) | ✓ + sync Steam auto | ✓ WebSocket temps réel |
 | Calculateur | ✓ Complet | ✓ + float crafting | ✓ |
 | P&L & Stats | ✗ (phase V1) | ✓ Table simple | ✓ Graphiques interactifs |
+
+---
+
+### 4.13 Module ActionRecommender — Quoi acheter/vendre, quand, où
+
+#### Architecture du module en détail
+
+Le module ActionRecommender est la **couche de sortie finale** de Kontract.gg. Il agrège tous les signaux calculés en amont (Kontract Score, PriceSignalEngine, score hybride listings, OutputSellEngine, slots disponibles) pour produire une liste d'actions concrètes et priorisées.
+
+Chaque action est un **item exact** avec un lien direct, un prix cible, un timing, et une plateforme. L'utilisateur n'a aucune décision à prendre — juste à exécuter.
+
+```
+INPUT  → Tous les modules amont (scanner, portefeuille, momentum, sell engine)
+OUTPUT → Liste d'actions triées par priorité :
+         [ACHETER maintenant] FAMAS REM MW float=0.143 — 7.93€ → lien Skinport
+         [ACHETER ce soir]    FAMAS REM MW float=0.146 — si prix < 8.10€
+         [VENDRE maintenant]  AWP Fever Dream FT → 22.40€ sur Skinport
+         [ATTENDRE]           AK Redline FT — inputs en hausse, patienter 48h
+```
+
+---
+
+#### Architecture du module
+
+```python
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+from datetime import datetime, timedelta
+
+class ActionType(str, Enum):
+    BUY_NOW      = "buy_now"       # achat immédiat recommandé
+    BUY_WATCH    = "buy_watch"     # surveiller — acheter si prix descend
+    BUY_WAIT     = "buy_wait"      # attendre avant d'acheter (signal défavorable)
+    SELL_NOW     = "sell_now"      # vendre immédiatement
+    SELL_HOLD    = "sell_hold"     # garder encore N jours
+    SELL_WATCH   = "sell_watch"    # surveiller le prix avant de vendre
+    EXECUTE      = "execute"       # panier complet → exécuter le trade-up dans CS2
+    ABANDON      = "abandon"       # abandonner le panier, revendre les inputs
+
+class ActionPriority(str, Enum):
+    URGENT   = "urgent"    # fenêtre de quelques minutes (listing rare, prix optimal)
+    HIGH     = "high"      # agir dans les prochaines heures
+    NORMAL   = "normal"    # agir dans la journée
+    LOW      = "low"       # agir cette semaine
+
+@dataclass
+class Action:
+    """Représente une action concrète à exécuter."""
+    type:          ActionType
+    priority:      ActionPriority
+
+    # Identification de l'item EXACT
+    market_hash_name: str          # ex: "FAMAS | Rapid Eye Movement (Minimal Wear)"
+    sale_id:          Optional[str] # ID unique du listing Skinport (si BUY_NOW)
+    assetid:          Optional[str] # assetid Steam (si item déjà en inventaire)
+
+    # Prix et plateforme
+    platform:         str           # "skinport" | "steam" | "buff163"
+    price:            float          # prix exact du listing
+    price_target:     Optional[float] # seuil d'achat pour BUY_WATCH
+    url:              str            # lien direct vers le listing ou la page vente
+
+    # Contexte et justification
+    basket_id:        Optional[str]  # panier associé (si achat input)
+    opportunity_name: str            # ex: "FAMAS REM → AWP Fever Dream FN"
+    reason:           str            # justification en clair
+    score:            float          # score de priorité 0–100
+
+    # Float (si pertinent)
+    float_val:        Optional[float]
+    float_norm:       Optional[float]
+
+    # Timing
+    expires_at:       Optional[datetime]  # après cette date, l'action est caduque
+    valid_until_price: Optional[float]    # valide tant que le prix reste en dessous
+
+    # Metadata
+    created_at:       datetime
+    listing_score:    Optional[float]  # score hybride du listing (buy actions)
+```
+
+---
+
+#### ActionRecommender — générateur d'actions
+
+```python
+class ActionRecommender:
+    """
+    Agrège tous les signaux pour produire la liste d'actions prioritaires.
+    Exécuté à chaque cycle de 5 min (APScheduler) + en temps réel (WebSocket).
+    """
+
+    def generate_action_plan(
+        self,
+        portfolio:      dict,
+        opportunities:  list,
+        prices:         dict,
+        history:        dict,
+        collections_db: dict,
+        user_config:    dict,
+    ) -> list[Action]:
+        """
+        Point d'entrée principal. Retourne la liste complète des actions
+        triées par score décroissant (plus urgent en premier).
+        """
+        actions = []
+
+        # 1. Actions d'achat pour les paniers actifs
+        for basket in portfolio["active_baskets"]:
+            actions += self._buy_actions(basket, prices, history)
+
+        # 2. Actions de vente pour les outputs en attente
+        for output in portfolio["pending_outputs"]:
+            actions += self._sell_actions(output, prices, history,
+                                           collections_db, portfolio)
+
+        # 3. Actions d'exécution (paniers complets)
+        for basket in portfolio["active_baskets"]:
+            if basket.state.is_complete:
+                actions.append(self._execute_action(basket))
+
+        # 4. Actions d'abandon (paniers dont le score a trop chuté)
+        for basket in portfolio["active_baskets"]:
+            should_quit, reason = should_abandon_basket(
+                basket.state,
+                basket.opportunity,
+                user_config["min_kontract_score"],
+                prices,
+            )
+            if should_quit:
+                actions += self._abandon_actions(basket, prices, reason)
+
+        # 5. Nouvelles opportunités à ouvrir si slots disponibles
+        free_slots = portfolio["slots_optimal"] - len(portfolio["active_baskets"])
+        if free_slots > 0:
+            actions += self._new_opportunity_actions(
+                opportunities, portfolio, free_slots, prices, history, collections_db
+            )
+
+        # Trier par score décroissant
+        return sorted(actions, key=lambda a: -a.score)
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ACTIONS D'ACHAT — inputs pour les paniers actifs
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _buy_actions(
+        self,
+        basket: dict,
+        prices: dict,
+        history: dict,
+    ) -> list[Action]:
+        """
+        Pour chaque input manquant dans le panier, trouve le meilleur
+        listing disponible et génère une action d'achat concrète.
+        """
+        actions = []
+        target   = basket.opportunity
+        state    = basket.state
+        n_needed = state.n_remaining
+
+        for skin_needed in target["inputs_required"]:
+            if state._skin_already_bought(skin_needed["market_hash_name"]):
+                continue
+
+            # Récupérer les listings disponibles (via WebSocket cache)
+            listings = self._get_cached_listings(skin_needed["market_hash_name"])
+            if not listings:
+                continue
+
+            # Appliquer hard filters + score hybride
+            ranked = rank_input_listings(
+                raw_listings = listings,
+                target       = {
+                    **skin_needed,
+                    "median_price":    prices[skin_needed["id"]]["median_price"],
+                    "max_input_price": target["max_input_price"],
+                    "stattrak":        target["stattrak"],
+                    "float_crafting":  target.get("float_crafting", False),
+                    "norm_min":        target.get("norm_min", 0),
+                    "norm_max":        target.get("norm_max", 1),
+                    "norm_center":     target.get("norm_center", 0.5),
+                },
+                panier_state = {
+                    "n_bought":      state.n_bought,
+                    "floats_bought": state.floats_bought,
+                    "avg_price":     state.avg_price_bought,
+                },
+                top_n = 3,
+            )
+
+            for rank, listing in enumerate(ranked["top_listings"]):
+                if listing["score"] < 60:
+                    break  # en-dessous du seuil — ne pas recommander
+
+                # Construire l'URL directe vers le listing
+                url = f"https://skinport.com/item/{listing['url']}/{listing['sale_id']}"
+
+                # Urgence basée sur le score et la liquidité
+                priority = (
+                    ActionPriority.URGENT if listing["score"] >= 80 and rank == 0
+                    else ActionPriority.HIGH if listing["score"] >= 70
+                    else ActionPriority.NORMAL
+                )
+
+                # L'action expire quand le listing sera probablement vendu
+                # Sur un skin avec vol_24h=8, un listing dure ~1–3h en moyenne
+                vol_24h  = history.get(skin_needed["market_hash_name"],
+                                       {}).get("last_24_hours", {}).get("volume", 1)
+                ttl_hours = max(0.5, 24 / max(vol_24h, 1))
+                expires   = datetime.utcnow() + timedelta(hours=ttl_hours)
+
+                actions.append(Action(
+                    type             = ActionType.BUY_NOW,
+                    priority         = priority,
+                    market_hash_name = listing["market_hash_name"],
+                    sale_id          = listing["sale_id"],
+                    assetid          = None,
+                    platform         = "skinport",
+                    price            = listing["price"],
+                    price_target     = None,
+                    url              = url,
+                    basket_id        = basket["id"],
+                    opportunity_name = target["name"],
+                    reason           = (
+                        f"Input {state.n_bought+1}/{state.n_required} "
+                        f"— score listing {listing['score']}/100 "
+                        f"({listing['price_saving_pct']:+.1f}% vs médiane)"
+                    ),
+                    score          = listing["score"],
+                    float_val      = listing.get("float_val"),
+                    float_norm     = listing.get("float_norm"),
+                    expires_at     = expires,
+                    valid_until_price = listing["price"] * 1.03,  # valide si prix < +3%
+                    created_at     = datetime.utcnow(),
+                    listing_score  = listing["score"],
+                ))
+
+        return actions
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ACTIONS DE VENTE — outputs reçus
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _sell_actions(
+        self,
+        output:         dict,
+        prices:         dict,
+        history:        dict,
+        collections_db: dict,
+        portfolio:      dict,
+    ) -> list[Action]:
+        """
+        Pour chaque output en attente, décide de la stratégie optimale
+        de vente et génère l'action concrète.
+        """
+        skin_name    = output["market_hash_name"]
+        current_price = prices.get(skin_name, {}).get("min_price", 0)
+        if not current_price:
+            return []
+
+        # Calculer le momentum output
+        coll_id    = output.get("collection_id")
+        collection = collections_db.get(coll_id, {})
+        hist_out   = history.get(skin_name, {})
+        momentum   = PriceSignalEngine().compute_output_momentum(
+            output_skin  = output,
+            collection   = collection,
+            history      = hist_out,
+            items        = prices.get(skin_name, {}),
+            peer_skins   = [],
+        )
+
+        # Décision hold vs sell
+        engine   = OutputSellEngine()
+        decision = engine.decide(
+            output_skin      = output,
+            execution_price  = current_price,
+            roi_tradeup      = output.get("roi_tradeup", 0.18),
+            cycle_days       = output.get("cycle_days", 5),
+            portfolio        = portfolio,
+            momentum         = momentum,
+            market_context   = {"days_since_valve_update": get_days_since_update()},
+        )
+
+        if decision["decision"] == "sell_now":
+            # Choisir la meilleure plateforme de vente
+            sell_platform, sell_url = self._best_sell_platform(skin_name, current_price)
+
+            return [Action(
+                type             = ActionType.SELL_NOW,
+                priority         = ActionPriority.HIGH,
+                market_hash_name = skin_name,
+                sale_id          = None,
+                assetid          = output.get("assetid"),
+                platform         = sell_platform,
+                price            = current_price,
+                price_target     = None,
+                url              = sell_url,
+                basket_id        = output.get("basket_id"),
+                opportunity_name = output.get("opportunity_name", ""),
+                reason           = decision["reason"],
+                score            = 85,
+                float_val        = output.get("float_val"),
+                float_norm       = None,
+                expires_at       = datetime.utcnow() + timedelta(hours=6),
+                valid_until_price = current_price * 0.97,  # valide si > −3%
+                created_at       = datetime.utcnow(),
+                listing_score    = None,
+            )]
+
+        else:
+            # Hold — générer une action de surveillance
+            hold_days    = decision["hold_days"]
+            stop_loss    = decision["stop_loss"]
+            review_at    = datetime.utcnow() + timedelta(days=hold_days)
+
+            return [Action(
+                type             = ActionType.SELL_HOLD,
+                priority         = ActionPriority.LOW,
+                market_hash_name = skin_name,
+                sale_id          = None,
+                assetid          = output.get("assetid"),
+                platform         = "skinport",
+                price            = current_price,
+                price_target     = current_price * (1 + decision["expected_gain"] / 100),
+                url              = f"https://skinport.com/item/{output.get('url_slug', '')}",
+                basket_id        = output.get("basket_id"),
+                opportunity_name = output.get("opportunity_name", ""),
+                reason           = (
+                    f"Hold {hold_days}j — gain espéré "
+                    f"+{decision['expected_gain']}% | "
+                    f"Stop-loss : {stop_loss:.2f}€"
+                ),
+                score            = 40,
+                float_val        = output.get("float_val"),
+                float_norm       = None,
+                expires_at       = review_at,
+                valid_until_price = stop_loss,  # vendre si prix descend sous stop-loss
+                created_at       = datetime.utcnow(),
+                listing_score    = None,
+            )]
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # NOUVELLES OPPORTUNITÉS — si slots disponibles
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _new_opportunity_actions(
+        self,
+        opportunities:  list,
+        portfolio:      dict,
+        free_slots:     int,
+        prices:         dict,
+        history:        dict,
+        collections_db: dict,
+    ) -> list[Action]:
+        """
+        Pour chaque slot libre, suggère l'opportunité et les inputs exacts
+        à acheter en premier pour démarrer le panier.
+        """
+        actions = []
+        # Prendre les meilleures opportunités non encore en portefeuille
+        available = [
+            o for o in opportunities
+            if o["portfolio_status"] == "active"
+            and not self._basket_exists(o["id"])
+        ][:free_slots]
+
+        for opp in available:
+            # Trouver les meilleurs listings pour le PREMIER input à acheter
+            # (on commence par l'input le plus liquide pour limiter le risque)
+            first_input = self._get_best_first_input(opp, prices, history)
+            if not first_input:
+                continue
+
+            url = f"https://skinport.com/item/{first_input['url']}/{first_input['sale_id']}"
+
+            actions.append(Action(
+                type             = ActionType.BUY_NOW,
+                priority         = ActionPriority.NORMAL,
+                market_hash_name = first_input["market_hash_name"],
+                sale_id          = first_input["sale_id"],
+                assetid          = None,
+                platform         = "skinport",
+                price            = first_input["price"],
+                price_target     = None,
+                url              = url,
+                basket_id        = None,  # panier pas encore ouvert
+                opportunity_name = opp["name"],
+                reason           = (
+                    f"Nouvelle opportunité — Kontract Score {opp['kontract_score']} | "
+                    f"ROI {opp['roi']*100:.1f}% | "
+                    f"Premier input à acheter (1/10) "
+                    f"— score listing {first_input['score']}/100"
+                ),
+                score            = opp["kontract_score"] * 2,  # pondéré par le score opp
+                float_val        = first_input.get("float_val"),
+                float_norm       = first_input.get("float_norm"),
+                expires_at       = datetime.utcnow() + timedelta(hours=2),
+                valid_until_price = first_input["price"] * 1.05,
+                created_at       = datetime.utcnow(),
+                listing_score    = first_input["score"],
+            ))
+
+        return actions
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # HELPERS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _best_sell_platform(self, skin_name: str, price: float) -> tuple[str, str]:
+        """
+        Choisit la meilleure plateforme de vente selon le prix et la liquidité.
+        MVP : Skinport uniquement. V2 : + comparaison Steam.
+        """
+        # Skinport : 3% frais vendeur, interface simple, liquidité internationale
+        skinport_url = f"https://skinport.com/sell?search={skin_name.replace(' ', '+')}"
+        # Steam : 15% frais, mais 100M+ utilisateurs = meilleure liquidité
+        steam_url    = f"https://steamcommunity.com/market/listings/730/{skin_name.replace(' ', '%20')}"
+
+        # Règle simple MVP : Skinport si prix > 10€, Steam sinon (plus de liquidité)
+        if price >= 10:
+            return "skinport", skinport_url
+        return "steam", steam_url
+
+    def _get_best_first_input(self, opp: dict, prices: dict, history: dict) -> dict | None:
+        """
+        Parmi tous les inputs d'une opportunité, retourne le meilleur listing
+        pour commencer le panier (le plus liquide au meilleur prix).
+        """
+        best = None
+        for skin in opp["inputs_required"]:
+            listings = self._get_cached_listings(skin["market_hash_name"])
+            if not listings:
+                continue
+            ranked = rank_input_listings(
+                listings, target={**skin,
+                    "median_price":    prices.get(skin["id"], {}).get("median_price", 999),
+                    "max_input_price": opp.get("max_input_price", 999),
+                    "stattrak":        opp.get("stattrak", False),
+                    "float_crafting":  False,
+                    "norm_min": 0, "norm_max": 1, "norm_center": 0.5,
+                },
+                panier_state={"n_bought": 0, "floats_bought": [], "avg_price": 0},
+                top_n=1,
+            )
+            if ranked["top_listings"]:
+                candidate = ranked["top_listings"][0]
+                if best is None or candidate["score"] > best["score"]:
+                    best = candidate
+        return best
+```
+
+---
+
+#### Format de sortie — Plan d'action complet
+
+Le plan d'action est généré toutes les 5 minutes et à chaque événement WebSocket. Il est affiché dans le dashboard (page Portefeuille) et poussé sur Telegram.
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 PLAN D'ACTION KONTRACT.GG — 14h32 · 3 slots actifs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔴 URGENT — 2 actions
+──────────────────────────────────────────────────
+[1] ACHETER MAINTENANT
+    FAMAS | Rapid Eye Movement (Minimal Wear)
+    Float : 0.1430 (norm 0.893 ✓) | Score listing : 84/100
+    Prix : 7.93€ (−17% vs médiane) | Skinport
+    Panier : FAMAS REM → AWP Fever Dream FN (3/10 inputs)
+    → 🛒 https://skinport.com/item/famas-rapid-eye-movement/6934215
+    ⏱️ Expire dans ~2h (vol 24h = 8 ventes/j)
+
+[2] ACHETER MAINTENANT
+    FAMAS | Rapid Eye Movement (Minimal Wear)
+    Float : 0.1460 (norm 0.920 ✓) | Score listing : 79/100
+    Prix : 7.95€ (−17% vs médiane) | Skinport
+    Panier : idem — 4/10 après achat
+    → 🛒 https://skinport.com/item/famas-rapid-eye-movement/6934221
+
+🟡 CE SOIR — 3 actions
+──────────────────────────────────────────────────
+[3] SURVEILLER — ACHETER SI PRIX ≤ 8.10€
+    FAMAS | Rapid Eye Movement (Minimal Wear)
+    Prix actuel : 8.39€ (légèrement au-dessus de la cible)
+    Surveiller : https://skinport.com/market/730?item=famas-rapid-eye-movement
+    Panier : FAMAS REM → AWP Fever Dream FN (5/10 après les 2 achats ci-dessus)
+
+[4] VENDRE MAINTENANT
+    AWP | Fever Dream (Field-Tested) — float 0.247
+    Prix actuel : 22.40€ | Momentum : 📈 +0.52 mais slot libre disponible
+    → Seuil hold non atteint (gain espéré +7.5% < seuil +10.8%)
+    → 💰 https://skinport.com/sell (chercher "AWP Fever Dream FT")
+
+[5] ATTENDRE — ne pas acheter encore
+    AK-47 | Redline (Field-Tested) — inputs panier AK → Asiimov
+    Recipe velocity détectée : inputs +6% en 24h
+    → Attendre retour à la normale (estimé 24–48h)
+    → Surveiller : https://skinport.com/market/730?item=ak47-redline
+
+🟢 CETTE SEMAINE — 1 action
+──────────────────────────────────────────────────
+[6] NOUVELLE OPPORTUNITÉ — 1 slot disponible
+    M4A4 | Howl input → AWP | Dragon Lore BS
+    Kontract Score : 18.9 | ROI : +15% | Pool : 2 outcomes
+    Premier input à acheter :
+    M4A4 | Howl (Field-Tested) float=0.289 | Score : 77/100
+    Prix : 12.40€ | Skinport
+    → 🛒 https://skinport.com/item/m4a4-howl/7234156
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+#### Alerte Telegram condensée (pour les actions urgentes uniquement)
+
+```
+🔴 ACTION URGENTE — KONTRACT.GG
+
+[ACHETER] FAMAS | REM MW
+Float 0.143 · Score 84/100 · 7.93€ (−17%)
+Panier : Fever Dream FN · Input 3/10
+
+→ 🛒 skinport.com/item/famas-rapid-eye-movement/6934215
+
+[ACHETER] même skin — listing suivant
+Float 0.146 · Score 79/100 · 7.95€
+→ 🛒 skinport.com/item/famas-rapid-eye-movement/6934221
+```
+
+---
+
+#### Cas spécial — Stratégie avec fillers : liens exacts pour chaque filler
+
+Quand la stratégie "fillers" est sélectionnée, le plan d'action donne les **7 inputs collection cible + 3 fillers avec liens directs** vers chaque item optimal.
+
+```python
+def _build_filler_action_plan(
+    opp:     dict,   # opportunité avec stratégie "fillers"
+    prices:  dict,
+    history: dict,
+) -> list[Action]:
+    """
+    Pour une stratégie fillers 7+3, génère :
+    - 7 actions d'achat pour les inputs collection cible
+    - 3 actions d'achat pour les fillers optimaux
+    Chaque action pointe vers le listing exact le moins cher
+    avec le float le plus large possible (post-update oct 2025).
+    """
+    actions = []
+
+    # ── 7 inputs collection cible ─────────────────────────────────────
+    for i, skin in enumerate(opp["inputs_cible"][:7]):
+        listings = get_cached_listings(skin["market_hash_name"])
+        ranked   = rank_input_listings(listings, target=skin,
+                       panier_state={"n_bought": i, "floats_bought": [], "avg_price": 0},
+                       top_n=1)
+        if ranked["top_listings"]:
+            best = ranked["top_listings"][0]
+            actions.append(Action(
+                type             = ActionType.BUY_NOW,
+                market_hash_name = best["market_hash_name"],
+                sale_id          = best["sale_id"],
+                url              = f"https://skinport.com/item/{best['url']}/{best['sale_id']}",
+                price            = best["price"],
+                reason           = f"Input {i+1}/7 (collection cible)",
+                # ...
+            ))
+
+    # ── 3 fillers optimaux ───────────────────────────────────────────
+    # Critères post-oct 2025 : moins cher + float range le plus large
+    filler_candidates = opp["filler_collection"]["skins"]
+    fillers_sorted    = sorted(
+        filler_candidates,
+        key=lambda s: (prices.get(s["id"], {}).get("min_price", 999),
+                       -(s["float_max"] - s["float_min"]))  # prix ASC, range DESC
+    )[:3]
+
+    for j, filler in enumerate(fillers_sorted):
+        filler_listings = get_cached_listings(filler["market_hash_name"])
+        filler_ranked   = rank_input_listings(
+            filler_listings,
+            target={
+                **filler,
+                "float_crafting": False,  # float neutre pour fillers
+                "norm_min": 0, "norm_max": 1, "norm_center": 0.5,
+                "stattrak": opp["stattrak"],
+                "median_price": prices.get(filler["id"], {}).get("median_price", 0),
+                "max_input_price": opp.get("max_filler_price", 5.0),
+            },
+            panier_state={"n_bought": 7+j, "floats_bought": [], "avg_price": 0},
+            top_n=1,
+        )
+        if filler_ranked["top_listings"]:
+            best_filler = filler_ranked["top_listings"][0]
+            actions.append(Action(
+                type             = ActionType.BUY_NOW,
+                market_hash_name = best_filler["market_hash_name"],
+                sale_id          = best_filler["sale_id"],
+                url              = (
+                    f"https://skinport.com/item/"
+                    f"{best_filler['url']}/{best_filler['sale_id']}"
+                ),
+                price            = best_filler["price"],
+                float_val        = best_filler.get("float_val"),
+                reason           = (
+                    f"Filler {j+1}/3 — {filler['name']} "
+                    f"float range {filler['float_min']:.2f}–{filler['float_max']:.2f} "
+                    f"(range={filler['float_max']-filler['float_min']:.2f}) "
+                    f"| Prix : {best_filler['price']:.2f}€"
+                ),
+                # ...
+            ))
+
+    return actions
+```
+
+**Exemple de sortie pour une stratégie fillers :**
+
+```
+PLAN D'ACHAT — FAMAS REM → AWP Fever Dream FN (stratégie fillers 7+3)
+Coût estimé total : 63.51€ | ROI estimé : +24%
+
+INPUTS COLLECTION CIBLE (7×)
+[1] FAMAS | REM MW  float=0.143  7.93€  score 84  → skinport.com/item/.../6934215
+[2] FAMAS | REM MW  float=0.146  7.95€  score 79  → skinport.com/item/.../6934221
+[3] FAMAS | REM MW  float=0.137  8.00€  score 71  → skinport.com/item/.../6934301
+[4] FAMAS | REM MW  float=0.144  8.00€  score 69  → skinport.com/item/.../6934318
+[5] FAMAS | REM MW  float=0.139  8.32€  score 65  → skinport.com/item/.../6934422
+[6] FAMAS | REM MW  float=0.125  8.41€  score 63  → skinport.com/item/.../6934509
+[7] FAMAS | REM MW  float=0.132  8.39€  score 61  → skinport.com/item/.../6934601
+
+FILLERS (3×) — collection Genesis, float range max
+[8] MP5-SD | Focus (MW)   float=0.112  0.84€  range 0.00–1.00  → skinport.com/item/.../7012301
+[9] MP5-SD | Focus (MW)   float=0.098  0.86€  range 0.00–1.00  → skinport.com/item/.../7012389
+[10] MP5-SD | Focus (MW)  float=0.124  0.89€  range 0.00–1.00  → skinport.com/item/.../7012412
+
+Float output prédit : 0.71 → Battle-Scarred
+(Pour viser FT sur l'output, utiliser la stratégie pure sans fillers)
+```
+
+---
+
+#### Schéma BDD — table actions
+
+```sql
+action_plans :
+    id               UUID PRIMARY KEY,
+    user_id          UUID,
+    generated_at     TIMESTAMP,
+    cycle_id         INTEGER  -- numéro du cycle 5min
+
+actions :
+    id               UUID PRIMARY KEY,
+    plan_id          UUID REFERENCES action_plans(id),
+    user_id          UUID,
+    type             TEXT,    -- buy_now | buy_watch | sell_now | sell_hold | execute | abandon
+    priority         TEXT,    -- urgent | high | normal | low
+    market_hash_name TEXT,
+    sale_id          TEXT,    -- NULL si pas un listing spécifique
+    assetid          TEXT,    -- NULL si pas encore en inventaire
+    platform         TEXT,
+    price            DECIMAL(10,2),
+    price_target     DECIMAL(10,2),  -- NULL sauf buy_watch
+    url              TEXT,
+    basket_id        UUID,
+    opportunity_name TEXT,
+    reason           TEXT,
+    score            DECIMAL(6,2),
+    float_val        DECIMAL(10,8),
+    listing_score    DECIMAL(5,1),
+    expires_at       TIMESTAMP,
+    valid_until_price DECIMAL(10,2),
+    -- Lifecycle
+    status           TEXT,    -- "pending" | "executed" | "expired" | "cancelled"
+    executed_at      TIMESTAMP,
+    created_at       TIMESTAMP
+```
+
+---
+
+
+### 4.15 Module — Fonctions utilitaires (stubs)
+
+Ces fonctions sont appelées par plusieurs modules. Elles sont regroupées ici pour éviter la duplication dans le code.
+
+```python
+# ── helpers/ev.py ─────────────────────────────────────────────────────────────
+
+async def calculate_ev(
+    inputs: list,
+    output_target: dict,
+    prices: dict,
+    frais_vente: float = FEES["skinport"]["seller"],
+) -> tuple[float, float]:
+    """Calcule (ev_nette, roi) pour une liste d'inputs et un output cible."""
+    prob = 1 / len(output_target["outputs"])  # simplifié — réel dans ev_calculator.py
+    ev_brute = sum(prob * get_sell_price(o, prices)[0] for o in output_target["outputs"])
+    cout = sum(get_input_price(prices.get(s["id"], {})) for s in inputs)
+    ev_nette = ev_brute * (1 - frais_vente) - cout
+    roi = ev_nette / cout if cout > 0 else 0
+    return ev_nette, roi
+
+async def get_current_sell_price(market_hash_name: str) -> float:
+    """Prix de vente actuel sur Skinport (min_price ou médiane si min aberrant)."""
+    items = await skinport_cache.get(market_hash_name)
+    return get_input_price(items or {}) or 0.0
+
+def get_current_min_price(item: dict) -> float:
+    """Prix minimum actuel pour un item (depuis le cache Skinport)."""
+    return skinport_cache.get_sync(item["market_hash_name"], {}).get("min_price", 0.0)
+
+def get_output_wear_from_float(float_val: float, output_skin: dict) -> str:
+    """Détermine la condition de wear depuis le float et les bornes du skin."""
+    f_min = output_skin.get("float_min", 0.0)
+    f_max = output_skin.get("float_max", 1.0)
+    # Normaliser sur [0,1] via les bornes réelles
+    if f_max <= f_min: return "Unknown"
+    thresholds = [("Factory New", 0.07), ("Minimal Wear", 0.15),
+                  ("Field-Tested", 0.38), ("Well-Worn", 0.45)]
+    for wear, cap in thresholds:
+        if float_val < f_min + cap * (f_max - f_min):
+            return wear
+    return "Battle-Scarred"
+
+def get_days_since_update() -> int:
+    """Retourne le nombre de jours depuis la dernière MAJ Valve connue."""
+    # En MVP : valeur statique mise à jour manuellement après chaque update
+    # En V2 : scrape https://store.steampowered.com/news/app/730
+    from datetime import date
+    LAST_KNOWN_UPDATE = date(2026, 1, 24)  # mettre à jour manuellement
+    return (date.today() - LAST_KNOWN_UPDATE).days
+
+# ── helpers/inventory.py ──────────────────────────────────────────────────────
+
+async def recalculate_opportunity(opp: dict, prices: dict) -> dict:
+    """Recalcule EV, ROI et Kontract Score avec les prix frais."""
+    ev_nette, roi = await calculate_ev(opp["inputs"], opp, prices)
+    momentum = PriceSignalEngine().compute_output_momentum(
+        opp["output_skin"], opp["collection"], 
+        prices.get("history", {}).get(opp["output_name"], {}),
+        prices.get(opp["output_name"], {}), []
+    )
+    score, _ = calculate_kontract_score({
+        **opp, "ev_nette": ev_nette,
+        "output_momentum_score": momentum["momentum_score"],
+    })
+    return {**opp, "ev_nette": ev_nette, "roi": roi, "kontract_score": score}
+
+async def create_basket(opp: dict, user: dict) -> dict:
+    """Crée un nouveau panier en BDD et retourne l'objet basket."""
+    basket_id = await db.insert_basket({
+        "user_id": user["id"], "opportunity_id": opp["id"],
+        "n_required": 5 if opp.get("is_covert") else 10,
+        "status": "in_progress",
+    })
+    return {"id": basket_id, "opportunity": opp, "user": user,
+            "state": PanierState(basket_id, user["id"])}
+
+def _get_cached_listings(market_hash_name: str) -> list:
+    """Récupère les listings en cache (WebSocket feed + TTL 5min)."""
+    return websocket_cache.get(market_hash_name, [])
+
+def get_peer_skins(collection: dict, exclude_skin: dict) -> list:
+    """Retourne les autres skins de la même collection (pour corrélation momentum)."""
+    return [s for s in collection.get("contains", [])
+            if s["id"] != exclude_skin.get("id")]
+
+async def get_detected_output(basket_id: str) -> dict:
+    """Récupère l'output auto-détecté depuis la BDD (table trade_up_baskets)."""
+    return await db.get_basket_field(basket_id,
+        ["output_detected", "output_float", "output_wear"])
+
+# ── helpers/notifications.py ─────────────────────────────────────────────────
+
+async def notify_basket_ready(basket: dict):
+    """Alerte Telegram : panier complet, prêt à exécuter."""
+    opp = basket["opportunity"]
+    msg = (
+        f"✅ Panier complet — {opp['name']}\n"
+        f"10/10 inputs dans l'inventaire ✓\n"
+        f"Float output prédit : {basket['state'].predict_output_float(opp['output_skin']):.4f}\n"
+        f"EV estimée : {opp['ev_nette']:+.2f}€\n"
+        f"→ Ouvrir CS2 → Inventaire → Contrats"
+    )
+    await telegram_bot.send(basket["user"]["id"], msg)
+
+async def notify_basket_opened(basket: dict):
+    """Alerte Telegram : nouveau panier ouvert."""
+    opp = basket["opportunity"]
+    await telegram_bot.send(basket["user"]["id"],
+        f"📂 Nouveau panier ouvert — {opp['name']}\n"
+        f"Kontract Score : {opp['kontract_score']} | ROI : {opp['roi']*100:.1f}%\n"
+        f"Premier achat recommandé dans le Plan d'action."
+    )
+
+async def notify_abandon_recommendation(basket: dict, reason: str):
+    """Alerte Telegram : abandon recommandé avec calcul perte."""
+    await telegram_bot.send(basket["user"]["id"],
+        f"⚠️ Abandon recommandé — {basket['opportunity']['name']}\n"
+        f"Raison : {reason}\n"
+        f"→ Voir le Plan d'action pour les liens de revente."
+    )
+
+async def schedule_hold_monitoring(basket_id: str, hold_days: int, engine: "OutputSellEngine"):
+    """Planifie la réévaluation toutes les 5min pendant le hold."""
+    # APScheduler job temporaire — supprimé automatiquement après hold_days
+    scheduler.add_job(
+        func=lambda: check_hold_and_notify(basket_id, engine),
+        trigger="interval", minutes=5,
+        id=f"hold_{basket_id}",
+        end_date=datetime.utcnow() + timedelta(days=hold_days),
+    )
+
+# ── helpers/selectors.py ─────────────────────────────────────────────────────
+
+def select_cheapest(candidates: list, n: int = 10) -> list:
+    """Sélectionne les N skins les moins chers parmi les candidats."""
+    return sorted(candidates, key=lambda s: s.get("min_price", 999))[:n]
+
+def select_cheapest_low_float(candidates: list, n: int = 10,
+                               target_avg_norm: float = 0.05) -> list:
+    """
+    Sélectionne les N skins avec le meilleur compromis prix/float bas.
+    Utilisé pour le float crafting Factory New.
+    """
+    scored = []
+    for c in candidates:
+        price = c.get("min_price", 999)
+        fnorm = c.get("float_norm", 0.5)
+        # Score : favorise les floats proches de target ET les prix bas
+        float_dist = abs(fnorm - target_avg_norm)
+        score = price * (1 + float_dist * 5)  # pénaliser les floats éloignés
+        scored.append((score, c))
+    return [c for _, c in sorted(scored)[:n]]
+```
+
+
+### 4.16 Stratégies non encore exploitées
+
+#### Stratégie 1 — Reverse finder (output → inputs optimaux)
+
+Déjà mentionné dans la roadmap S4 mais non spécifié. Le sens inverse : l'utilisateur choisit un output désirable (ex: AWP Dragon Lore FN) et le moteur identifie automatiquement les inputs permettant de l'obtenir au meilleur ROI.
+
+```python
+def reverse_find_inputs(
+    target_output: dict,
+    prices:         dict,
+    collections_db: dict,
+    constraints:    dict,   # budget, float_target, stattrak, etc.
+) -> list[dict]:
+    """
+    Pour un output cible, trouve toutes les combinaisons d'inputs
+    permettant de l'obtenir, triées par ROI décroissant.
+    """
+    results = []
+    # Trouver toutes les collections dont cet output est membre
+    for collection in collections_db.values():
+        for skin in collection["contains"]:
+            if skin["rarity"]["id"] == target_output["rarity"]["id"]:
+                # Ce skin peut être un input pour produire cet output
+                strategy_pure  = calc_pure_strategy(skin, target_output, prices, collection)
+                strategy_filler = calc_filler_strategy(skin, target_output, prices, collection)
+                results += [strategy_pure, strategy_filler]
+
+    return sorted(
+        [r for r in results if r["roi"] >= constraints.get("min_roi", 0.05)],
+        key=lambda x: -x["kontract_score"]
+    )
+```
+
+---
+
+#### Stratégie 2 — Covert → Couteaux/Gants (5 inputs)
+
+Spécifique à la règle post-octobre 2025. Seulement 5 inputs au lieu de 10. Le budget est réduit de moitié mais les outputs (couteaux, gants) peuvent valoir 5–50× le coût des inputs.
+
+```python
+COVERT_STRATEGY = {
+    "n_inputs":           5,         # règle Valve post-oct 2025
+    "rarity_required":    "rarity_ancient_weapon",   # Covert uniquement
+    "output_tier":        "gold",    # couteaux et gants
+    "min_input_price":    20.0,      # les Covert coûtent généralement 20–200€
+    "leverage_ratio":     "10–50×",  # output vaut 10 à 50× le coût inputs
+    "risk":               "très élevé — pool d'outputs très large",
+    "recommended_for":    "capital > 500€, appétit risque élevé",
+}
+
+def calculate_covert_ev(inputs: list, prices: dict) -> dict:
+    """
+    EV spécifique aux trade-ups Covert → Gold.
+    Pool d'outputs = tous les couteaux + gants disponibles.
+    Pondération identique (1/nb_outputs).
+    """
+    all_gold = get_all_gold_items(prices)  # couteaux + gants
+    prob_per  = 1 / len(all_gold)
+    ev_brute  = sum(prob_per * prices.get(g["market_hash_name"], {}).get("median_price", 0)
+                   for g in all_gold)
+    cout      = sum(get_input_price(prices.get(s["id"], {})) for s in inputs[:5])
+    return {"ev_nette": ev_brute * 0.97 - cout, "roi": (ev_brute * 0.97 - cout) / cout}
+```
+
+---
+
+#### Stratégie 3 — StatTrak EV différenciée
+
+Un trade-up StatTrak produit un output StatTrak, qui vaut généralement 20–40% de plus. Mais les inputs StatTrak coûtent aussi plus cher. Le calcul doit être fait séparément car les marchés sont différents.
+
+```python
+def calculate_stattrak_premium_ev(
+    inputs_st: list,     # inputs StatTrak
+    output_st: dict,     # output StatTrak cible
+    inputs_nst: list,    # inputs non-StatTrak (référence)
+    output_nst: dict,    # output non-StatTrak (référence)
+    prices: dict,
+) -> dict:
+    """
+    Compare EV ST vs EV non-ST et calcule si le premium StatTrak
+    justifie le surcoût des inputs.
+    """
+    ev_st,  roi_st  = calculate_ev(inputs_st,  output_st,  prices)
+    ev_nst, roi_nst = calculate_ev(inputs_nst, output_nst, prices)
+
+    cout_st  = sum(get_input_price(prices.get(s["id"], {})) for s in inputs_st)
+    cout_nst = sum(get_input_price(prices.get(s["id"], {})) for s in inputs_nst)
+    st_premium_cost   = cout_st  - cout_nst
+    st_premium_output = ev_st    - ev_nst
+
+    return {
+        "ev_nette_st":          ev_st,
+        "ev_nette_nst":         ev_nst,
+        "roi_st":               roi_st,
+        "roi_nst":              roi_nst,
+        "st_worth_it":          roi_st > roi_nst,
+        "premium_cost_pct":     st_premium_cost  / cout_nst  if cout_nst else 0,
+        "premium_output_pct":   st_premium_output / ev_nst   if ev_nst   else 0,
+        "recommendation": "StatTrak" if roi_st > roi_nst else "Non-StatTrak",
+    }
+```
+
+---
+
+#### Stratégie 4 — Liquidity decay modeling (impact prix achat 10× même skin)
+
+Acheter 10 unités du même skin fait monter les prix. La spec ignore actuellement cet effet. Pour les skins peu liquides (< 50 ventes/7j), acheter 10 unités consomme une fraction significative du carnet.
+
+```python
+def estimate_execution_cost(
+    skin_name:   str,
+    n_needed:    int,
+    prices:      dict,
+    history:     dict,
+) -> dict:
+    """
+    Estime le coût réel d'achat de N unités en tenant compte
+    de la pression prix (on ne peut pas tout acheter au min_price).
+    """
+    min_price    = prices.get(skin_name, {}).get("min_price", 0)
+    median_price = prices.get(skin_name, {}).get("median_price", 0)
+    quantity     = prices.get(skin_name, {}).get("quantity", 0)
+    vol_7d       = history.get(skin_name, {}).get("last_7_days", {}).get("volume", 1)
+
+    # Si on a besoin de plus de 20% du stock disponible → impact prix
+    demand_ratio = n_needed / max(quantity, 1)
+
+    if demand_ratio < 0.20:
+        # Peu d'impact — utiliser min_price
+        return {"avg_cost": min_price, "price_impact": 0, "risk": "low"}
+    elif demand_ratio < 0.50:
+        # Impact modéré — interpoler entre min et médiane
+        avg_cost = min_price + (median_price - min_price) * demand_ratio
+        return {"avg_cost": avg_cost, "price_impact": avg_cost - min_price, "risk": "medium"}
+    else:
+        # Impact fort — utiliser médiane + 10%
+        avg_cost = median_price * 1.10
+        return {"avg_cost": avg_cost, "price_impact": avg_cost - min_price, "risk": "high",
+                "warning": f"Acheter {n_needed} unités représente {demand_ratio*100:.0f}% du stock"}
+```
+
+---
+
+#### Stratégie 5 — Time-to-fill estimation
+
+Combien de temps pour compléter un panier ? Nécessaire pour calculer le cycle_days réel utilisé dans l'OutputSellEngine.
+
+```python
+def estimate_time_to_fill(
+    inputs_required: list,
+    history:         dict,
+    n_needed:        int = 10,
+) -> dict:
+    """
+    Estime la durée pour compléter un panier, en jours.
+    Basé sur le volume de ventes quotidien de chaque input.
+    """
+    bottleneck_days = 0
+    bottleneck_skin = None
+
+    for skin in inputs_required:
+        h        = history.get(skin["market_hash_name"], {})
+        vol_24h  = h.get("last_24_hours", {}).get("volume", 0) or 0.1
+        days_for_skin = n_needed / vol_24h  # jours pour trouver N unités
+        if days_for_skin > bottleneck_days:
+            bottleneck_days = days_for_skin
+            bottleneck_skin = skin["name"]
+
+    return {
+        "estimated_days":  round(bottleneck_days, 1),
+        "bottleneck_skin": bottleneck_skin,
+        "cycle_days_total": round(bottleneck_days + 0.5, 1),  # +0.5j exécution
+        "confidence":       "high" if bottleneck_days < 2 else
+                            "medium" if bottleneck_days < 7 else "low",
+    }
+```
+
+Intégré dans `calculate_kontract_score` via `cycle_days` pour l'OutputSellEngine, et affiché dans le panneau de détail Scanner.
+
+---
+
+#### Stratégie 6 — Backtesting module
+
+Valide la précision du moteur EV sur des données historiques. Indispensable pour calibrer les paramètres et démontrer la valeur aux utilisateurs.
+
+```python
+def backtest_strategy(
+    historical_prices: list,   # prix historiques par date
+    historical_trades: list,   # trades réels exécutés (pnl_records)
+    strategy_config:   dict,
+) -> dict:
+    """
+    Rejoue la stratégie sur les prix historiques et compare
+    les résultats simulés aux résultats réels.
+    """
+    simulated_pnl = []
+    for date_slice in historical_prices:
+        opportunities = scan_all(date_slice["prices"], date_slice["history"])
+        top_10 = sorted(opportunities, key=lambda x: -x["kontract_score"])[:10]
+        for opp in top_10:
+            future_price = get_future_price(opp["output_name"],
+                                            date_slice["date"],
+                                            days_ahead=5,
+                                            historical_prices=historical_prices)
+            if future_price:
+                simulated_pnl.append(future_price - opp["cout_ajuste"])
+
+    return {
+        "simulated_roi_avg":  sum(simulated_pnl) / len(simulated_pnl),
+        "win_rate":           sum(1 for p in simulated_pnl if p > 0) / len(simulated_pnl),
+        "vs_real_pnl":        compare_with_real(simulated_pnl, historical_trades),
+        "ev_calibration":     "ok" if abs(sum(simulated_pnl)/len(simulated_pnl)
+                                         - strategy_config["expected_roi"]) < 0.05 else "drift",
+    }
+```
+
+> Scope V2 — nécessite 3+ mois de données historiques accumulées en interne.
+
+---
+
+### 4.17 Module LLM — Intelligence artificielle dans Kontract.gg
+
+#### Pourquoi un LLM ? Cas d'usage identifiés
+
+Le LLM n'est pas utile pour les calculs quantitatifs (l'EV, le score, les probabilités sont mieux faits par du code déterministe). Il est utile pour **les tâches qui nécessitent du langage naturel, du contexte et du raisonnement sur des données non structurées**.
+
+| Cas d'usage | Valeur | Faisabilité MVP |
+|------------|--------|----------------|
+| Analyse des patch notes Valve → impact prix | ⭐⭐⭐⭐⭐ | ✓ |
+| Résumé narratif du plan d'action | ⭐⭐⭐ | ✓ |
+| Explication pédagogique d'une opportunité | ⭐⭐⭐⭐ | ✓ |
+| Détection d'anomalies textuelles (forums, Discord) | ⭐⭐⭐ | V2 |
+| Assistant de configuration (onboarding) | ⭐⭐ | V2 |
+| Prédiction de MAJ Valve (signal faible) | ⭐⭐⭐⭐ | V2 |
+
+---
+
+#### LLM Call 1 — Analyse de patch notes Valve
+
+Le signal de risque Valve le plus précoce possible : analyser les patch notes le jour même et estimer l'impact potentiel sur les prix des skins.
+
+```python
+async def analyze_valve_patch(patch_notes: str) -> dict:
+    """
+    Analyse les patch notes Valve avec un LLM pour détecter
+    les changements susceptibles d'impacter les prix des skins.
+    Appelé dès qu'une nouvelle MAJ est détectée (monitoring updates.valve.com).
+    """
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 1000,
+        "system": (
+            "You are an expert CS2 skin market analyst. "
+            "Analyze CS2 patch notes and identify any changes that could affect skin prices. "
+            "Respond ONLY in JSON with this exact schema: "
+            '{"risk_level": "low|medium|high|critical", ' +
+            '"affected_categories": ["covert", "knives", "gloves", ...], ' +
+            '"price_direction": "up|down|mixed|unknown", ' +
+            '"trade_up_impact": "none|minor|major|game_changing", ' +
+            '"summary": "2-sentence explanation", ' +
+            '"recommended_action": "hold|sell|buy|pause_trading"}' +
+            " No preamble, no markdown, pure JSON."
+        ),
+        "messages": [{"role": "user", "content": f"Patch notes to analyze:\n{patch_notes}"}],
+    })
+
+    text = response["content"][0]["text"]
+    result = json.loads(text)
+
+    # Si impact élevé → alerte immédiate à tous les utilisateurs
+    if result["risk_level"] in ("high", "critical"):
+        await alert_all_users_valve_update(result)
+
+    return result
+```
+
+**Exemple de réponse pour la MAJ octobre 2025 :**
+```json
+{
+  "risk_level": "critical",
+  "affected_categories": ["knives", "gloves", "covert"],
+  "price_direction": "mixed",
+  "trade_up_impact": "game_changing",
+  "summary": "Trade-up contracts now allow 5 Covert skins to produce knives/gloves. This massively increases knife supply and crashes their prices, while spiking Covert skin demand.",
+  "recommended_action": "sell"
+}
+```
+
+---
+
+#### LLM Call 2 — Explication pédagogique d'une opportunité
+
+Pour les nouveaux utilisateurs, l'EV et le Kontract Score sont des concepts abstraits. Un LLM peut générer une explication claire, en français, adaptée au niveau de l'utilisateur.
+
+```python
+async def explain_opportunity(opportunity: dict, user_level: str = "beginner") -> str:
+    """
+    Génère une explication claire de pourquoi cette opportunité est intéressante.
+    user_level: "beginner" | "intermediate" | "expert"
+    """
+    opp_data = {
+        "name":          opportunity["name"],
+        "roi":           f"{opportunity['roi']*100:.1f}%",
+        "ev_nette":      f"{opportunity['ev_nette']:.2f}€",
+        "pool_size":     opportunity["pool_size"],
+        "momentum":      opportunity.get("output_momentum_verdict", "neutral"),
+        "win_prob":      f"{opportunity.get('win_prob', 0)*100:.0f}%",
+        "floor_ratio":   f"{opportunity.get('floor_ratio', 0)*100:.0f}%",
+        "collection_inactive": opportunity.get("collection_inactive", False),
+    }
+    level_instruction = {
+        "beginner":     "Explain simply in 3-4 sentences as if to someone who just started trading CS2 skins. Avoid jargon.",
+        "intermediate": "Explain in 4-5 sentences, mentioning EV and ROI naturally.",
+        "expert":       "Be concise, mention Sharpe ratio, floor ratio, momentum. Max 3 sentences.",
+    }[user_level]
+
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 300,
+        "messages": [{
+            "role": "user",
+            "content": (
+                f"Explain this CS2 trade-up opportunity in French: {json.dumps(opp_data)}. "
+                f"{level_instruction} "
+                f"Focus on why it is a good opportunity RIGHT NOW."
+            )
+        }],
+    })
+    return response["content"][0]["text"]
+```
+
+---
+
+#### LLM Call 3 — Détection de signaux faibles sur forums/Discord (V2)
+
+Les forums communautaires (r/csgomarketforum, Discord trading servers) contiennent souvent des signaux avant qu'ils ne se reflètent dans les prix. Un LLM peut monitorer ces sources et identifier les opportunités mentionnées.
+
+```python
+async def analyze_community_signal(posts: list[str], skin_names: list[str]) -> dict:
+    """
+    Analyse des posts communautaires pour détecter les mentions
+    bullish/bearish sur des skins spécifiques.
+    Appelé toutes les heures sur un sample de posts Reddit/Discord.
+    """
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 500,
+        "system": (
+            "You analyze CS2 trading community posts to find bullish/bearish signals. "
+            "Respond in JSON: {"signals": [{"skin": str, "sentiment": "bullish|bearish|neutral", "
+            ""confidence": 0-1, "reason": str}]}"
+        ),
+        "messages": [{
+            "role": "user",
+            "content": (
+                f"Skins to monitor: {skin_names}\n"
+                f"Community posts:\n" + "\n---\n".join(posts[:20])
+            )
+        }],
+    })
+    return json.loads(response["content"][0]["text"])
+```
+
+---
+
+#### LLM Call 4 — Assistant de configuration (onboarding)
+
+À la première connexion, au lieu d'un formulaire complexe, un LLM guide l'utilisateur par conversation pour configurer son profil optimal.
+
+```python
+ONBOARDING_SYSTEM = """
+You are Kontract, an AI assistant helping CS2 skin traders configure their trade-up strategy.
+Ask 3-4 natural questions to determine:
+1. Their budget (€)
+2. Their risk appetite (conservative/balanced/aggressive)
+3. Their available time per day (few minutes / 1 hour / several hours)
+4. Whether they use BUFF163 or Skinport only
+
+Based on answers, recommend a PORTFOLIO_CONFIG in JSON.
+Keep conversation friendly and in the user's language.
+"""
+
+async def onboarding_conversation(messages: list[dict]) -> dict:
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 500,
+        "system": ONBOARDING_SYSTEM,
+        "messages": messages,
+    })
+    text = response["content"][0]["text"]
+    # Si la réponse contient un JSON de config → configuration terminée
+    try:
+        config = json.loads(text.split("```json")[-1].split("```")[0])
+        return {"status": "complete", "config": config, "message": text}
+    except:
+        return {"status": "continue", "message": text}
+```
+
+---
+
+#### LLM Call 5 — Résumé narratif du plan d'action quotidien
+
+Plutôt qu'une liste brute d'actions, un LLM génère un briefing matinal en 3-4 phrases qui contextualise ce qu'il faut faire aujourd'hui.
+
+```python
+async def generate_daily_briefing(
+    actions:      list[dict],
+    portfolio:    dict,
+    market_ctx:   dict,
+) -> str:
+    """
+    Génère un résumé narratif du plan d'action pour la journée.
+    Envoyé via Telegram à 9h chaque matin.
+    """
+    summary = {
+        "urgent_actions":   len([a for a in actions if a["priority"] == "urgent"]),
+        "active_baskets":   len(portfolio["active_baskets"]),
+        "total_invested":   portfolio["capital_engaged"],
+        "pending_outputs":  len(portfolio.get("pending_outputs", [])),
+        "market_momentum":  market_ctx.get("global_trend", "neutral"),
+        "seasonal_phase":   market_ctx.get("seasonal_phase", "neutral"),
+        "days_since_update": market_ctx.get("days_since_valve_update", 30),
+    }
+
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 200,
+        "messages": [{
+            "role": "user",
+            "content": (
+                f"Write a 3-sentence morning briefing in French for a CS2 trader: "
+                f"{json.dumps(summary)}. "
+                f"Be direct, mention the most important action first, "
+                f"and note any risk or opportunity in the market context."
+            )
+        }],
+    })
+    return response["content"][0]["text"]
+```
+
+---
+
+#### Coûts et rate limits LLM
+
+| Call | Fréquence | Tokens ≈ | Coût estimé/mois |
+|------|-----------|---------|-----------------|
+| Patch notes analyzer | Lors de chaque update Valve | 2 000 | < 0.50€ |
+| Opportunity explainer | À la demande (clic utilisateur) | 500 | ~5€ / 1000 clics |
+| Community signals | 1×/heure | 5 000 | ~15€/mois |
+| Onboarding conversation | 1×/nouvel utilisateur | 3 000 | < 0.10€/user |
+| Daily briefing | 1×/jour/utilisateur | 1 000 | ~1€/100 users/mois |
+
+**Total estimé pour 100 utilisateurs actifs :** < 25€/mois — négligeable vs le MRR de 900€.
+
+> **Modèle recommandé** : `claude-sonnet-4-6` — meilleur rapport qualité/coût pour ces tâches structurées. Les calls LLM ne sont jamais sur le chemin critique de l'EV (qui reste 100% déterministe).
 
 ---
 
@@ -2750,6 +5024,7 @@ Tableau de bord de performance long terme.
 | Float API | httpx → api.csfloat.com | — | Récupération float exact via liens inspect Steam (V1) |
 | Déploiement | Railway | — | ~7$/mois, zero DevOps, déploiement GitHub auto |
 | Monitoring | Sentry + UptimeRobot | — | Alertes erreurs + downtime, gratuits aux seuils MVP |
+| LLM (V1) | Anthropic claude-sonnet-4-6 | — | 5 LLM calls : patch analyzer, explainer, onboarding, briefing |
 
 ### 5.2 Dépendance critique : décompression Brotli
 
@@ -2790,7 +5065,7 @@ kontract/
 ├── engine/
 │   ├── ev_calculator.py     # Formule EV post-oct 2025 + float-conditional EV
 │   ├── scanner.py           # Scan vectorisé NumPy, filtres, scoring
-│   ├── kontract_score.py    # Kontract Score v3 (Sharpe ratio, floor, hold discount)
+│   ├── kontract_score.py    # Kontract Score v4 (Sharpe ratio, floor, hold discount, momentum)
 │   └── filters.py           # Hard filters + score hybride listings (inputs)
 ├── basket/
 │   ├── panier_state.py      # Classe PanierState — suivi panier en cours
@@ -2800,17 +5075,36 @@ kontract/
 │   ├── portfolio_engine.py  # PortfolioEngine — cycle 5min, conflits, slots
 │   └── buy_alert_engine.py  # BuyAlertEngine — WebSocket → alertes < 500ms
 ├── pnl/
-│   └── tracker.py           # record_execution(), verify_float_prediction()
+│   ├── tracker.py           # record_execution(), verify_float_prediction()
+│   └── sell_engine.py       # OutputSellEngine — décision hold/sell + stop-loss
+├── recommender/
+│   ├── action_recommender.py # ActionRecommender — plan d'actions complet
+│   ├── buy_planner.py        # _buy_actions(), _new_opportunity_actions()
+│   └── sell_planner.py       # _sell_actions(), _best_sell_platform()
 ├── alerts/
 │   ├── telegram_bot.py      # Bot Telegram + commandes /config /panier /executed
 │   └── notifier.py          # Match opportunités ↔ profils utilisateurs
 ├── ui/
 │   ├── pages/
+│   │   ├── plan_action.py   # Page 0 — Plan d'action (accueil) + vues détail
 │   │   ├── scanner.py       # Page 1 — Scanner + filtres + détail opportunité
 │   │   ├── portefeuille.py  # Page 2 — Paniers actifs + listings recommandés
 │   │   ├── calculateur.py   # Page 3 — Calculateur manuel + float crafting
 │   │   └── pnl.py           # Page 4 — Historique trades + stats + courbe P&L
-│   └── dashboard.py         # Streamlit app root + sidebar navigation
+│   └── dashboard.py         # Streamlit app root + sidebar navigation (5 pages)
+├── helpers/
+│   ├── ev.py               # calculate_ev(), get_current_sell_price(), get_current_min_price()
+│   ├── inventory.py        # recalculate_opportunity(), create_basket(), get_peer_skins()
+│   ├── notifications.py    # notify_basket_ready/opened/abandon, schedule_hold_monitoring
+│   └── selectors.py        # select_cheapest(), select_cheapest_low_float()
+├── llm/
+│   ├── patch_analyzer.py   # LLM Call 1 — analyse patch notes Valve
+│   ├── explainer.py        # LLM Call 2 — explication pédagogique opportunité
+│   ├── community.py        # LLM Call 3 — signaux forums/Discord (V2)
+│   ├── onboarding.py       # LLM Call 4 — configuration guidée par LLM
+│   └── briefing.py         # LLM Call 5 — résumé narratif quotidien
+└── backtesting/
+    └── backtest.py         # backtest_strategy() — validation sur données historiques (V2)
 ├── auth/
 │   └── supabase.py          # OAuth Steam + gestion sessions
 └── main.py                  # APScheduler + WebSocket + orchestration + startup
@@ -2825,7 +5119,7 @@ kontract/
 | Phase | Durée | Livrables techniques | Sources données | Go-live |
 |-------|-------|---------------------|----------------|---------|
 | **MVP** | 3 semaines | BDD ByMykel + Skinport REST fetcher + moteur EV + Kontract Score + hard filters + score hybride listings + bot Telegram + Streamlit 4 pages (Scanner, Portefeuille basique, Calculateur) + PanierState déclaration manuelle + Portfolio Engine (sélection top 10, conflits, alertes WebSocket) | ByMykel + Skinport + Steam | Semaine 3 |
-| **V1 — Lancement** | 3 semaines | Auth Supabase+Steam + OAuth Steam, Stripe Free/Trader/Pro, sync inventaire Steam automatique, OutputDetector + polling, CSFloat float auto, P&L Tracker + page P&L, should_abandon_basket() opérationnel, vérification précision float | + Steam Inventory API + CSFloat | Semaine 6 |
+| **V1 — Lancement** | 3 semaines | Auth Supabase+Steam + OAuth Steam, Stripe Free/Trader/Pro, sync inventaire Steam automatique, OutputDetector + polling, CSFloat float auto, P&L Tracker + page P&L, should_abandon_basket() opérationnel, vérification précision float, OutputSellEngine 4.11 (décision hold/sell + stop-loss monitoring) | + Steam Inventory API + CSFloat | Semaine 6 |
 | **V2 — Croissance** | 4 semaines | Float-conditional EV, BUFF163 scraping direct, React dashboard, Kelly Criterion UI, multi-sourcing inputs, Pricempire si MRR > 1 800€ | + BUFF163 direct | Semaine 10 |
 | **V3 — Expansion** | Continu | StatTrak dédié, mobile, ML prédiction prix, Rust/Dota 2 | + Pricempire si besoin | Semaine 16+ |
 
@@ -2867,12 +5161,13 @@ La version 2.0 (mars 2026) est une spécification complète couvrant l'ensemble 
 
 **Architecture clé :**
 - 100% gratuit pour le MVP : ByMykel CSGO-API + Skinport API + Steam API
-- WebSocket Skinport en temps réel pour les alertes d'achat (< 500ms)
-- Kontract Score v3 (Sharpe ratio — suppression du double-comptage win_prob × EV)
+- WebSocket Skinport en temps réel pour les alertes d'achat, ActionRecommender 4.13 (plan d'actions Telegram avec items exacts + liens directs) (< 500ms)
+- Kontract Score v4 (Sharpe ratio — suppression double-comptage + momentum multiplier)
 - 8 hard filters + score hybride 4 dimensions pour chaque listing
 - PanierState avec sync inventaire Steam et calcul dynamique du float marginal requis
 - OutputDetector : détection automatique de l'output via comparaison d'inventaire
 - P&L Tracker avec vérification de la précision de la formule de float
+- OutputSellEngine : décision hold vs vente immédiate basée sur la vélocité du capital et le momentum — stop-loss automatique pendant le hold
 
 | Coût données MVP | Délai MVP | Modules | Rate limit Skinport | Dépendances critiques |
 |-----------------|-----------|---------|---------------------|-----------------------|
