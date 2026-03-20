@@ -54,6 +54,7 @@ with st.sidebar:
     max_pool = st.slider("Pool max", 1, 20, 15)  # Aligné sur main.py (15)
     min_vol_sell = st.slider("Volume min (30j)", 0, 100, 10)  # Aligné sur main.py (10)
     min_liq = st.slider("Liquidité min (score)", 0.0, 10.0, 1.0, 0.5)  # Spec §4.5
+    min_vol_input = st.slider("Volume input min (ventes/j)", 0.0, 5.0, 0.1, 0.1)  # Filtre input
     exclude_down = st.checkbox("Exclure tendances baissières", False)
     exclude_volatility = st.checkbox("Exclure haute volatilité", False)
     min_ks = st.number_input("KS min", 0.0, 100.0, 0.0, 0.5)
@@ -65,12 +66,13 @@ with st.sidebar:
 
 # logic
 # Generate active filters signature to detect changes
-current_filters_sig = f"{min_roi}-{max_budget}-{max_pool}-{min_vol_sell}-{exclude_down}-{exclude_volatility}-{min_ks}-{source_buy}-{source_sell}"
+current_filters_sig = f"{min_roi}-{max_budget}-{max_pool}-{min_vol_sell}-{min_vol_input}-{exclude_down}-{exclude_volatility}-{min_ks}-{source_buy}-{source_sell}"
 
 if "filters_sig" not in st.session_state or st.session_state["filters_sig"] != current_filters_sig or scan_btn:
     filters = UserFilters(
         min_roi=float(min_roi), max_budget=max_budget, max_pool_size=max_pool,
         min_volume_sell_price=min_vol_sell, min_liquidity=min_liq,
+        min_volume_input=min_vol_input,
         exclude_trending_down=exclude_down,
         exclude_high_volatility=exclude_volatility, min_kontract_score=min_ks,
         source_buy=source_buy, source_sell=source_sell

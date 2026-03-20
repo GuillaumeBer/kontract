@@ -225,10 +225,12 @@ def calculate_ev(
             reliability = "insufficient"
 
             # 1. Sélection de la fenêtre (§4.3 adaptive windows)
+            # La fenêtre 30j utilise un seuil plus bas (1/3) car 30 jours lissent la volatilité
+            min_vol_30d = max(3, min_vol_7d // 3)
             if out.volume_7d and out.volume_7d >= min_vol_7d and out.median_7d:
                 price = out.median_7d
                 reliability = "high"
-            elif out.volume_30d and out.volume_30d >= min_vol_7d and out.median_30d:
+            elif out.volume_30d and out.volume_30d >= min_vol_30d and out.median_30d:
                 price = out.median_30d
                 reliability = "medium"
             elif out.avg_90d and out.avg_90d > 0:
