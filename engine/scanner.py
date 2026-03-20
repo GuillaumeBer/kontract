@@ -82,32 +82,57 @@ def is_price_anomaly(min_price: float, median_price: float) -> bool:
     return ratio < 0.5 or ratio > 2.0
 
 
-def check_input_liquidity(quantity: int | None, qty_needed: int = 10) -> str:
+def check_input_liquidity(
+    quantity: int | None,
+    buy_price: float | None = None,
+    median_price: float | None = None,
+    qty_needed: int = 10,
+) -> dict:
     """
-    Évalue le statut de liquidité des inputs selon la quantité disponible (spec §4.5).
-    Retourne : 'out_of_stock' | 'scarce' | 'partial' | 'liquid'
-    NOTE : None = quantité inconnue (colonne non encore peuplée) → 'liquid' par défaut
+    Évalue la liquidité des inputs et retourne une estimation du prix unitaire
+    corrigé selon la profondeur du carnet d'ordres (spec §4.5).
+
+    Retourne : {
+        'status': 'out_of_stock' | 'scarce' | 'partial' | 'liquid',
+        'estimated_unit_price': float | None,
+    }
+
+    - liquid  (qty ≥ qty_needed) : médiane × qty — estimation conservatrice
+    - partial (qty ≥ qty_needed//2) : interpolation (min + médiane) / 2
+    - scarce  (qty < qty_needed//2) : médiane × 1.20 — pénalité 20%
+    - None    : quantité inconnue → permissif, on garde le buy_price reçu
     """
     if quantity is None:
-        return "liquid"   # inconnu → permissif (on a un prix, le skin existe)
+        return {"status": "liquid", "estimated_unit_price": buy_price}
     if quantity == 0:
-        return "out_of_stock"
+        return {"status": "out_of_stock", "estimated_unit_price": None}
+
     if quantity >= qty_needed:
-        return "liquid"
+        return {"status": "liquid", "estimated_unit_price": median_price or buy_price}
     if quantity >= qty_needed // 2:
-        return "partial"
-    return "scarce"
+        if buy_price and median_price:
+            est = (buy_price + median_price) / 2
+        else:
+            est = buy_price or median_price
+        return {"status": "partial", "estimated_unit_price": est}
+    # scarce
+    base = median_price or buy_price or 0.0
+    return {"status": "scarce", "estimated_unit_price": base * 1.20}
 
 
 def validate_tradeup(skins: list) -> tuple[bool, str]:
     """
     Vérifie que la composition des inputs est valide selon les règles Valve (spec §4.4).
+    Inclut la règle Covert post-octobre 2025 : 5 inputs seulement pour rarity_ancient_weapon.
     """
     stattrak_vals = {getattr(s, 'stattrak', False) for s in skins}
     if len(stattrak_vals) > 1:
         return False, "stattrak_mixte"
     if any(getattr(s, 'souvenir', False) for s in skins):
         return False, "souvenir_interdit"
+    rarities = {getattr(s, 'rarity_id', None) for s in skins}
+    if "rarity_ancient_weapon" in rarities and len(skins) != 5:
+        return False, "covert_requires_5_inputs"
     return True, "valid"
 
 
@@ -157,17 +182,19 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
 
             # Détection anomalie min_price (spec §4.4 — fallback sur médiane)
             if raw_buy and med_buy and is_price_anomaly(raw_buy, med_buy):
-                buy_price = med_buy
+                base_price = med_buy
             else:
-                buy_price = raw_buy
+                base_price = raw_buy
 
-            if not buy_price or buy_price <= 0:
-                continue
-
-            # Vérification liquidité inputs (spec §4.5)
-            input_liquidity = check_input_liquidity(quantity, qty_needed=10)
+            # Vérification liquidité inputs + prix estimé corrigé (spec §4.5)
+            liq_result = check_input_liquidity(quantity, base_price, med_buy, qty_needed=10)
+            input_liquidity = liq_result["status"]
             if input_liquidity == "out_of_stock":
                 continue  # inexécutable — rejet
+
+            buy_price = liq_result["estimated_unit_price"]
+            if not buy_price or buy_price <= 0:
+                continue
 
             # Filtre liquidité input (volume journalier)
             input_vol_24h = bp_data.get("volume_24h") or 0.0
@@ -178,8 +205,11 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
             if quantity is not None and quantity < filters.min_quantity_input:
                 continue
 
-            cost_10 = buy_price * 10
-            if cost_10 > filters.max_budget:
+            # Règle Covert post-oct 2025 : rarity_ancient_weapon → 5 inputs (spec §4.4)
+            n_inputs = 5 if skin.rarity_id == "rarity_ancient_weapon" else 10
+
+            cost_n = buy_price * n_inputs
+            if cost_n > filters.max_budget:
                 f_budget += 1
                 continue
 
@@ -224,7 +254,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     f_no_output += 1
                     continue
 
-                # Construire les 10 inputs identiques
+                # Construire les inputs (5 pour Covert, 10 sinon — spec §4.4)
                 inputs_list = [
                     InputSkin(
                         skin_id=skin_id,
@@ -234,7 +264,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                         buy_price=buy_price,
                         source_buy=filters.source_buy,
                     )
-                    for _ in range(10)
+                    for _ in range(n_inputs)
                 ]
 
                 try:
@@ -246,6 +276,8 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                         min_vol_7d=filters.min_volume_sell_price,
                         exclude_trending_down=filters.exclude_trending_down,
                         input_trend=input_trend,
+                        input_liquidity_status=input_liquidity,
+                        vol_24h_input=input_vol_24h,
                     )
                     checked += 1
                 except ValueError:
@@ -268,9 +300,9 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     continue
 
                 # ── Scalability (spec §4.7) ──
-                # max_repeats = min(qty_i // 10) pour tous les inputs
+                # max_repeats = min(qty_i // n_inputs) pour tous les inputs
                 qty_val = quantity if quantity is not None else 999
-                max_repeats = qty_val // 10
+                max_repeats = qty_val // n_inputs
                 bottleneck_skin = skin.name if max_repeats < 10 else None
 
                 combo_hash = f"{skin_id}:{coll_id}"
@@ -278,6 +310,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "combo_hash": combo_hash,
                     "input_skin_id": skin_id,
                     "input_name": skin.name,
+                    "input_rarity_id": skin.rarity_id,
                     "collection_id": coll_id,
                     "ev_nette": result.ev_nette,
                     "roi": result.roi,
@@ -293,6 +326,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "kontract_score": result.kontract_score,
                     "price_reliability": result.price_reliability,
                     "high_volatility": result.high_volatility,
+                    "strategy_used": "pure",
                     "input_liquidity_status": input_liquidity,
                     "velocity_alert": velocity_alert,
                     "max_repeats": max_repeats,
@@ -327,6 +361,7 @@ def save_opportunities(opportunities: list[dict]) -> int:
                 .filter_by(combo_hash=opp["combo_hash"])
                 .first()
             )
+            n_inp = len(json.loads(opp.get("inputs_json", "[]")) or [opp["input_skin_id"]] * 10)
             if existing:
                 existing.ev_nette = opp["ev_nette"]
                 existing.roi = opp["roi"]
@@ -338,10 +373,13 @@ def save_opportunities(opportunities: list[dict]) -> int:
                 existing.kontract_score = opp["kontract_score"]
                 existing.floor_ratio = opp["floor_ratio"]
                 existing.input_liquidity_status = opp["input_liquidity_status"]
+                existing.cout_ajuste = opp["cout_ajuste"]
+                existing.high_volatility = opp["high_volatility"]
             else:
+                n_inputs_save = 5 if opp.get("input_rarity_id") == "rarity_ancient_weapon" else 10
                 session.add(Opportunity(
                     combo_hash=opp["combo_hash"],
-                    inputs_json=json.dumps([opp["input_skin_id"]] * 10),
+                    inputs_json=json.dumps([opp["input_skin_id"]] * n_inputs_save),
                     ev_nette=opp["ev_nette"],
                     roi=opp["roi"],
                     pool_size=opp["pool_size"],
@@ -352,6 +390,9 @@ def save_opportunities(opportunities: list[dict]) -> int:
                     kontract_score=opp["kontract_score"],
                     floor_ratio=opp["floor_ratio"],
                     input_liquidity_status=opp["input_liquidity_status"],
+                    strategy_used="pure",
+                    cout_ajuste=opp["cout_ajuste"],
+                    high_volatility=opp["high_volatility"],
                 ))
                 saved += 1
         session.commit()

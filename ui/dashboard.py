@@ -67,6 +67,13 @@ def _opportunities_to_df(opps: list[dict]) -> pd.DataFrame:
 st.title("🎯 Kontract.gg — CS2 Trade-Up Scanner")
 st.caption(f"Dernière mise à jour des prix : {_get_last_price_update()}")
 
+# Avertissement systémique permanent — risque Valve (spec §4.7)
+st.warning(
+    "⚠️ **Risque systémique** : toute mise à jour Valve peut invalider les opportunités en cours. "
+    "Les prix peuvent varier de ±30% en quelques heures sans préavis.",
+    icon=None,
+)
+
 # ─── Sidebar — Filtres ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Filtres")
@@ -82,6 +89,12 @@ with st.sidebar:
                            help="Nombre de ventes minimum pour considérer le prix médian comme statistiquement fiable.")
 
     exclude_down = st.checkbox("Exclure tendances baissières (> 15%)", value=False)
+    exclude_volatility = st.checkbox("Exclure haute volatilité 24h (> 15%)", value=False)
+    min_kontract_score = st.number_input(
+        "Kontract Score minimum",
+        min_value=0.0, max_value=100.0, value=0.0, step=0.5,
+        help="Filtre composite : EV/√CV × liquidité × exécutabilité. 0 = désactivé.",
+    )
 
     source_buy = st.selectbox("Source prix achat", ["skinport", "steam"], index=0)
     source_sell = st.selectbox("Source prix vente", ["skinport", "steam"], index=0)
@@ -108,6 +121,8 @@ if scan_btn or "opportunities" not in st.session_state:
         min_liquidity=min_liquidity,
         min_volume_sell_price=min_vol_sell,
         exclude_trending_down=exclude_down,
+        exclude_high_volatility=exclude_volatility,
+        min_kontract_score=min_kontract_score,
         source_buy=source_buy,
         source_sell=source_sell,
     )

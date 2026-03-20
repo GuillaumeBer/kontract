@@ -93,6 +93,10 @@ class UserAlert(Base):
     source_buy = Column(String, default="skinport")   # "skinport" | "steam"
     source_sell = Column(String, default="skinport")
     active = Column(Boolean, default=True)
+    min_input_qty = Column(Integer, default=10)
+    exclude_trending_down = Column(Boolean, default=False)
+    exclude_high_volatility = Column(Boolean, default=False)
+    min_kontract_score = Column(Float, default=0.0)
 
 
 class Opportunity(Base):
@@ -111,4 +115,7 @@ class Opportunity(Base):
     kontract_score = Column(Float, nullable=True)
     floor_ratio = Column(Float, nullable=True)
     input_liquidity_status = Column(String, nullable=True)  # "liquid" | "partial" | "scarce"
+    strategy_used = Column(String, nullable=True)           # "pure" | "fillers"
+    cout_ajuste = Column(Float, nullable=True)
+    high_volatility = Column(Boolean, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
