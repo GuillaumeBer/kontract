@@ -22,10 +22,13 @@ def _format_opportunity_message(opp: dict) -> str:
     )
     rel = opp.get("price_reliability", "low").upper()
     rel_emoji = "🟢" if rel == "HIGH" else "🟡" if rel == "MEDIUM" else "🔴"
-    
+    ks = opp.get("kontract_score", 0.0) or 0.0
+    ks_label = "🟢 Excellent" if ks >= 0.5 else "🟡 Bon" if ks >= 0.2 else "🟠 Moyen" if ks >= 0.1 else "🔴 Spéculatif"
+
     return (
         f"🎯 *Trade-up Profitable Détecté !*\n\n"
         f"*Input* : {opp['input_name']}\n"
+        f"*Kontract Score* : {ks:.2f} — {ks_label}\n"
         f"*ROI* : {opp['roi']:.1f}%\n"
         f"*Fiabilité Prix* : {rel_emoji} {rel}\n"
         f"*EV nette* : {opp['ev_nette']:.2f}€\n"

@@ -22,10 +22,6 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.skinport.com/v1"
 BROTLI_HEADERS = {"Accept-Encoding": "br"}
 
-# Frais Skinport
-FEE_BUY = 0.05   # 5% acheteur
-FEE_SELL = 0.03  # 3% vendeur
-
 
 async def fetch_items(currency: str = "EUR") -> list[dict]:
     """

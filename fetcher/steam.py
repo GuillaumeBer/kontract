@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 
 STEAM_API_URL = "https://steamcommunity.com/market/priceoverview/"
 
-# Frais Steam
-FEE_BUY = 0.15   # 15% acheteur
-FEE_SELL = 0.15  # 15% vendeur
-
 
 async def fetch_steam_price(market_hash_name: str, currency: int = 3) -> dict | None:
     """

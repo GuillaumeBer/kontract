@@ -24,6 +24,7 @@ from data.bymykel import build_collections_db
 from data.database import init_db
 from engine.scanner import UserFilters, save_opportunities, scan_all_opportunities
 from fetcher.skinport import update_prices_from_skinport
+from fetcher.steam import update_prices_from_steam
 
 load_dotenv()
 logging.basicConfig(
@@ -73,11 +74,31 @@ async def job_fetch_and_scan() -> None:
     logger.info("=== Cycle terminé ===")
 
 
+async def job_fetch_steam() -> None:
+    """Job toutes les 10 min : prix Steam sur les skins outputs prioritaires (cross-check §2.3)."""
+    logger.info("=== Fetch Steam prices démarré ===")
+    try:
+        # Limiter aux 50 premiers skins outputs pour rester dans le rate limit (100 req/5min)
+        from data.database import get_session
+        from data.models import Skin as SkinModel
+        with get_session() as session:
+            priority_ids = [
+                s.id for s in session.query(SkinModel)
+                .filter(SkinModel.market_hash_name.isnot(None))
+                .limit(50)
+                .all()
+            ]
+        stats = await update_prices_from_steam(skin_ids=priority_ids, delay=1.5)
+        logger.info("Steam: %s", stats)
+    except Exception as exc:
+        logger.error("Erreur fetch Steam: %s", exc)
+
+
 async def job_update_bymykel() -> None:
     """Job hebdomadaire : mise à jour BDD depuis ByMykel."""
     logger.info("=== MAJ ByMykel démarrée ===")
     try:
-        stats = build_collections_db()
+        stats = await build_collections_db()
         logger.info("ByMykel: %s", stats)
     except Exception as exc:
         logger.error("Erreur ByMykel: %s", exc)
@@ -113,6 +134,9 @@ async def main() -> None:
 
     # Job principal toutes les 5 min
     scheduler.add_job(job_fetch_and_scan, "interval", minutes=5, id="fetch_scan")
+
+    # Fetch Steam prices toutes les 10 min (cross-check §2.3, spec §3.2)
+    scheduler.add_job(job_fetch_steam, "interval", minutes=10, id="steam_fetch")
 
     # MAJ ByMykel hebdomadaire
     scheduler.add_job(job_update_bymykel, "interval", weeks=1, id="bymykel_update")

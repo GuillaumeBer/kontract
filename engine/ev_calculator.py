@@ -142,7 +142,9 @@ def calculate_ev(
     source_sell: str = "skinport",
     min_vol_7d: int = 7,
     exclude_trending_down: bool = False,
-    input_trend: float = 0.0,  # (avg_24h - avg_7d) / avg_7d des inputs — détection recipe velocity
+    input_trend: float = 0.0,        # (avg_24h - avg_7d) / avg_7d des inputs — détection recipe velocity
+    input_liquidity_status: str = "liquid",  # "liquid" | "partial" | "scarce" — §4.5
+    vol_24h_input: float = 0.0,      # volume 24h de l'input — §4.6 input_speed_bonus
 ) -> EVResult:
     """
     Calcule l'EV avec fallback sur les prix, détection de tendance et redistribution.
@@ -153,11 +155,13 @@ def calculate_ev(
       - sell_price spot disponible          → "low"
       - aucune donnée                       → exclu, probabilité redistribuée aux autres outputs
     """
-    if len(inputs) != 10:
-        raise ValueError(f"Un trade-up requiert exactement 10 inputs, reçu {len(inputs)}")
+    if len(inputs) not in (5, 10):
+        raise ValueError(f"Un trade-up requiert 5 ou 10 inputs, reçu {len(inputs)}")
 
     fee_buy = FEES[source_buy]["buy"]
     fee_sell = FEES[source_sell]["sell"]
+
+    n_inputs = len(inputs)
 
     # ÉTAPE 1 — Probabilités initiales par collection
     collection_counts: dict[str, int] = {}
@@ -172,7 +176,7 @@ def calculate_ev(
         if not coll_outputs:
             continue
 
-        coll_prob_weight = count / 10.0
+        coll_prob_weight = count / n_inputs
 
         # Évaluer fiabilité et prix ajusté de chaque output (avec fallback + tendance)
         valid_coll_outputs = []
@@ -209,6 +213,13 @@ def calculate_ev(
             if exclude_trending_down and reliability == "trending_down":
                 continue
 
+            # Étape 2b — Pénalité haute volatilité 24h (spec §4.3)
+            # Si la variation 24h dépasse 15% vs la moyenne 7j → prix × 0.85
+            if out.avg_7d and out.avg_7d > 0 and out.avg_24h:
+                if abs(out.avg_24h - out.avg_7d) / out.avg_7d > 0.15:
+                    price *= 0.85
+                    reliability = reliability + "_high_volatility"
+
             valid_coll_outputs.append((out, price, reliability))
 
         if not valid_coll_outputs:
@@ -225,9 +236,11 @@ def calculate_ev(
 
     # Fiabilité globale = le pire cas parmi les outputs
     def _rel_rank(rel: str) -> int:
-        if rel in ("stable", "trending_up") or rel.endswith("_price_divergence"):
+        # Normaliser : retirer les suffixes secondaires (_high_volatility, _price_divergence)
+        base = rel.replace("_high_volatility", "").replace("_price_divergence", "").rstrip("_")
+        if base in ("stable", "trending_up"):
             return 3
-        if rel in ("medium", "trending_down"):
+        if base in ("medium", "trending_down"):
             return 2
         return 1  # "low"
 
@@ -273,12 +286,9 @@ def calculate_ev(
     floor_factor = 1.0 if floor_ratio >= 0.20 else (0.5 + floor_ratio * 2.5)
 
     # ── Détection haute volatilité 24h (spec §4.3 Étape 2b) ──
-    high_volatility = False
-    for out, _, _ in processed_outputs:
-        if out.avg_7d and out.avg_7d > 0 and out.avg_24h:
-            if abs(out.avg_24h - out.avg_7d) / out.avg_7d > 0.15:
-                high_volatility = True
-                break
+    # La pénalité × 0.85 sur le prix a déjà été appliquée par output dans la boucle ci-dessus.
+    # On lève ici le flag global pour le score et l'affichage.
+    high_volatility = any("_high_volatility" in rel for _, _, rel in processed_outputs)
     volatility_factor = 0.70 if high_volatility else 1.00
 
     # ── Recipe velocity penalty (spec §4.7) ──
@@ -286,12 +296,29 @@ def calculate_ev(
     # Si les inputs montent > 10% en 24h, le trade-up est probablement en train d'être saturé.
     velocity_penalty = max(0.5, 1.0 - input_trend) if input_trend > 0.10 else 1.0
 
-    # ── Kontract Score v3 (spec §4.6) ──
+    # ── Trade hold discount (spec §4.6) ──
+    # 7 jours de hold sur Skinport/Steam → coût d'opportunité 0.5%/j
+    hold_discount = max(0.5, 1.0 - 0.005 * 7)  # = 0.965
+
+    # ── Exécutabilité inputs (spec §4.6) ──
+    input_exec_factor = {
+        "liquid":  1.00,
+        "partial": 0.75,
+        "scarce":  0.40,
+    }.get(input_liquidity_status, 0.40)
+
+    # ── Vitesse d'exécution inputs (spec §4.6) ──
+    input_speed_bonus = math.log1p(vol_24h_input)
+
+    # ── Kontract Score v3 complet (spec §4.6) ──
     bonus_liquidite = math.log1p(liquidity_score)
     kontract_score = (
         (ev_nette / math.sqrt(max(cv_pond, 0.01)))
         * floor_factor
         * (1 + bonus_liquidite)
+        * hold_discount
+        * input_exec_factor
+        * (1 + 0.15 * input_speed_bonus)
         * velocity_penalty
         * volatility_factor
     )

@@ -51,6 +51,10 @@ def _get_or_create_alert(session, chat_id: str) -> UserAlert:
 
 def _format_profile(alert: UserAlert) -> str:
     status = "✅ Active" if alert.active else "⏸ En pause"
+    trending = "Oui" if getattr(alert, "exclude_trending_down", False) else "Non"
+    volatility = "Oui" if getattr(alert, "exclude_high_volatility", False) else "Non"
+    ks_min = getattr(alert, "min_kontract_score", 0.0) or 0.0
+    min_qty = getattr(alert, "min_input_qty", 10) or 10
     return (
         f"*Votre profil Kontract.gg*\n\n"
         f"Statut : {status}\n"
@@ -58,9 +62,13 @@ def _format_profile(alert: UserAlert) -> str:
         f"Budget max (10x inputs) : {alert.max_budget}€\n"
         f"Pool max (nb outcomes) : {alert.max_pool_size}\n"
         f"Liquidité min (ventes/j) : {alert.min_liquidity}\n"
+        f"Kontract Score min : {ks_min}\n"
+        f"Quantité input min : {min_qty}\n"
+        f"Exclure tendances baissières : {trending}\n"
+        f"Exclure haute volatilité : {volatility}\n"
         f"Source achat : {alert.source_buy}\n"
         f"Source vente : {alert.source_sell}\n\n"
-        f"_Pour modifier : /config roi=15 pool=3 budget=200 liquidity=5_"
+        f"_Pour modifier : /config roi=15 pool=3 budget=200 liquidity=5 ks=0.2 qty=10 trending=1 volatility=1_"
     )
 
 
@@ -87,16 +95,17 @@ async def cmd_profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Usage : /config roi=15 pool=3 budget=200 liquidity=5
-    Paramètres acceptés : roi, pool, budget, liquidity, source_buy, source_sell
+    Usage : /config roi=15 pool=3 budget=200 liquidity=5 ks=0.2 qty=10 trending=1 volatility=1
+    Paramètres acceptés : roi, pool, budget, liquidity, ks, qty, trending, volatility, source_buy, source_sell
     """
     chat_id = str(update.effective_chat.id)
     args = context.args or []
 
     if not args:
         await update.message.reply_text(
-            "Usage : /config roi=15 pool=3 budget=200 liquidity=5\n"
-            "Paramètres : roi, pool, budget, liquidity"
+            "Usage : /config roi=15 pool=3 budget=200 liquidity=5 ks=0.2 qty=10 trending=1 volatility=1\n"
+            "Paramètres : roi, pool, budget, liquidity, ks (Kontract Score min), qty (quantité input min), "
+            "trending (0/1), volatility (0/1)"
         )
         return
 
@@ -134,6 +143,24 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 updated.append(f"Liquidité min → {alert.min_liquidity} ventes/j")
             except ValueError:
                 pass
+        if "ks" in params:
+            try:
+                alert.min_kontract_score = float(params["ks"])
+                updated.append(f"Kontract Score min → {alert.min_kontract_score}")
+            except ValueError:
+                pass
+        if "qty" in params:
+            try:
+                alert.min_input_qty = int(params["qty"])
+                updated.append(f"Quantité input min → {alert.min_input_qty}")
+            except ValueError:
+                pass
+        if "trending" in params:
+            alert.exclude_trending_down = params["trending"] not in ("0", "false", "non")
+            updated.append(f"Exclure tendances baissières → {'Oui' if alert.exclude_trending_down else 'Non'}")
+        if "volatility" in params:
+            alert.exclude_high_volatility = params["volatility"] not in ("0", "false", "non")
+            updated.append(f"Exclure haute volatilité → {'Oui' if alert.exclude_high_volatility else 'Non'}")
 
         session.commit()
 
