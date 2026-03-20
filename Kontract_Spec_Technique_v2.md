@@ -14,6 +14,19 @@ Version 2.0 — Mars 2026
 2. [Sources de données — 100% gratuit](#2-sources-de-données--100-gratuit)
 3. [Architecture technique](#3-architecture-technique)
 4. [Spécifications fonctionnelles](#4-spécifications-fonctionnelles)
+   - 4.1 BDD Collections
+   - 4.2 Agrégateur de prix
+   - 4.3 Moteur de calcul EV
+   - 4.4 Sélection et gestion des inputs (filtres + score hybride)
+   - 4.4.2 Suivi du panier — PanierState
+   - 4.5 Liquidité des inputs
+   - 4.6 Kontract Score v3
+   - 4.7 Détections avancées (recipe velocity, pump, scalability, Kelly, Doppler)
+   - 4.7.1 Décision d'abandon de panier
+   - 4.8 Portfolio Engine + BuyAlertEngine
+   - 4.9 Exécution & Détection automatique de l'output
+   - 4.10 P&L Tracker
+   - 4.11 Interface utilisateur — 4 pages
 5. [Stack technique](#5-stack-technique)
 6. [Roadmap](#6-roadmap)
 7. [Risques & mitigations](#7-risques--mitigations)
@@ -33,7 +46,7 @@ Kontract.gg est un SaaS B2C permettant aux traders de skins CS2 d'identifier en 
 - **Module 3** : Moteur de calcul EV avec filtres configurables par utilisateur
 - **Module 4** : Dashboard Streamlit + bot Telegram
 
-> **Hors scope MVP** : BUFF163 scraping direct (phase 2), Pricempire API (phase 2 si besoin), float crafting avancé (phase 2), app mobile (phase 3), StatTrak dédié (phase 3).
+> **Hors scope MVP** : Sync inventaire Steam auto (V1), OutputDetector (V1), CSFloat float auto (V1), P&L Tracker (V1), float-conditional EV (V2), BUFF163 scraping direct (V2), multi-sourcing inputs (V2), Pricempire API (V3 si MRR > 1 800€), app mobile (V3), StatTrak dédié (V3).
 
 ---
 
@@ -50,6 +63,9 @@ Après analyse complète des APIs disponibles (mars 2026), l'architecture de don
 | Skinport /v1/sales/history | Volume ventes 24h/7j/30j/90j — critère liquidité | API REST publique — aucune auth requise | 1x/5 min | 0€ | ✓ Autorisé — API officielle publique | **8 req/5 min** (cache 5 min) |
 | Skinport /v1/sales/out-of-stock | Prix référence skins hors stock | API REST publique — aucune auth requise | 1x/heure | 0€ | ✓ Autorisé | Non documentée — cache 1h |
 | Steam Market API | Prix de référence + volume Steam | API publique Valve | 1x/10 min | 0€ | ✓ Autorisé (100k req/jour) | 100 req/5 min |
+| Steam Inventory API | Inventaire d'un compte (items + assetids + inspect links) | API publique (inventaire public requis) | 1x/5 min | 0€ | ✓ Autorisé | ~1 req/min recommandé |
+| CSFloat API | Float exact d'un item via son lien inspect | API REST publique | À la demande | 0€ | ✓ Autorisé — service tiers | ~100 req/heure |
+| Skinport WebSocket `saleFeed` | Listings individuels temps réel (prix, float, stickers, pattern) | WebSocket socket.io + msgpack | Continu | 0€ | ✓ Autorisé — API officielle | Pas de limite documentée |
 
 > **Coût total données MVP : 0€** — Toutes les sources nécessaires au MVP sont gratuites et ne requièrent aucune inscription. Pricempire API (119.90$/mois / 10 000 appels) est mise en réserve pour la phase 2 si des sources additionnelles deviennent nécessaires.
 
@@ -187,24 +203,46 @@ Après analyse des tarifs réels (mars 2026), Pricempire API est exclue du MVP.
 
 ## 3. Architecture technique
 
-### 3.1 Vue d'ensemble — 4 modules
+### 3.1 Vue d'ensemble — modules par phase
 
-| Module | Rôle | Technologie | Complexité | Priorité |
-|--------|------|-------------|-----------|---------|
-| 1. BDD Collections | Structure statique : collections, raretés, floats, pools trade-up (ByMykel) | Python + SQLite → PostgreSQL | Faible | Semaine 1 |
-| 2. Agrégateur prix | Prix toutes les 5 min — Skinport API + Steam Market API | Python + APScheduler + Redis | Modérée | Semaine 2 |
-| 3. Moteur EV | Calcul EV de toutes les combinaisons, filtrage, scoring | Python + NumPy (vectorisé) | Faible | Semaine 3 |
-| 4. Interface & alertes | Dashboard utilisateur + bot Telegram + notifications | Streamlit (MVP) → React (V2) | Modérée | Semaine 3–4 |
+| Module | Rôle | Technologie | Phase |
+|--------|------|-------------|-------|
+| 4.1 BDD Collections | Structure statique : collections, raretés, floats, pools (ByMykel) | Python + SQLite → PostgreSQL | MVP S1 |
+| 4.2 Agrégateur prix | Prix toutes les 5 min — Skinport REST API | Python + APScheduler + Redis | MVP S2 |
+| 4.3 Moteur EV | Calcul EV, filtrage, Kontract Score | Python + NumPy vectorisé | MVP S2–3 |
+| 4.4 Sélection inputs | Hard filters + score hybride listing | Python | MVP S3 |
+| 4.4.2 PanierState | Suivi des inputs achetés, sync Steam | Python + Steam API | MVP/V1 |
+| 4.5 Liquidité inputs | Vérification exécutabilité du panier | Python | MVP S3 |
+| 4.6 Kontract Score | Score composite Sharpe ratio | Python | MVP S3 |
+| 4.7 Détections avancées | Recipe velocity, pump, scalability, Kelly | Python | MVP S3 |
+| 4.8 Portfolio Engine | Gestion multi-paniers, BuyAlertEngine WebSocket | Python + socket.io | MVP/V1 |
+| 4.9 Exécution & Output | OutputDetector, snapshot inventaire | Python + Steam API + CSFloat | V1 |
+| 4.10 P&L Tracker | Enregistrement résultats, précision EV | Python | V1 |
+| 4.11 Interface UI | 4 pages : Scanner / Portefeuille / Calculateur / P&L | Streamlit → React | MVP/V2 |
 
 ### 3.2 Flux de données — séquence complète
 
-1. Job hebdomadaire : téléchargement `collections.json` + `skins.json` de ByMykel → construction BDD pools d'outputs
-2. APScheduler toutes les 5 minutes : appel Skinport `/v1/items` (prix) + `/v1/sales/history` (liquidité)
-3. Normalisation : format uniforme (`market_hash_name`, `min_price`, `sell_price`, `volume_24h`, `timestamp`)
-4. Cache Redis TTL 5 min + écriture PostgreSQL si variation > 0,5%
-5. Moteur EV : scan vectorisé NumPy de toutes les combinaisons (~2–5 sec)
-6. Filtrage selon les profils utilisateurs (ROI min, budget max, pool max, liquidité min)
-7. Opportunités qualifiées → stockage BDD + push Telegram instantané aux abonnés concernés
+**Cycle de fond (toutes les 5 min) :**
+1. APScheduler → Skinport `/v1/items` + `/v1/sales/history` (2 req/5min, 25% du quota)
+2. Normalisation + cache Redis TTL 5min + écriture PostgreSQL si variation > 0.5%
+3. Scanner EV vectorisé NumPy sur toutes les combinaisons (~2–5 sec)
+4. Filtrage selon profils utilisateurs → opportunités qualifiées stockées en BDD
+5. Portfolio Engine : réévaluation des Kontract Scores des paniers actifs
+6. Détection d'abandon si score sous seuil → notification Telegram
+
+**Job hebdomadaire :**
+7. ByMykel `collections.json` + `skins.json` → rebuild BDD pools d'outputs
+
+**Flux temps réel (WebSocket continu) :**
+8. BuyAlertEngine écoute le WebSocket Skinport (`saleFeed`)
+9. Pour chaque listing entrant : hard filters + score hybride en < 500ms
+10. Si score ≥ 60 et skin nécessaire dans un panier actif → alerte Telegram avec lien direct
+
+**Cycle panier (V1) :**
+11. Sync inventaire Steam toutes les 5min → mise à jour PanierState
+12. Panier complet → OutputDetector prend un snapshot puis poll toutes les 30s
+13. Nouvel item détecté → float via CSFloat API → pré-remplissage `/executed`
+14. Confirmation utilisateur → enregistrement P&L + vérification précision float
 
 ---
 
@@ -215,13 +253,19 @@ Après analyse des tarifs réels (mars 2026), Pricempire API est exclue du MVP.
 #### Construction depuis ByMykel
 
 ```python
-import requests, json, sqlite3
+import asyncio, json, sqlite3
+import httpx
 
 BASE_URL = "https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en"
 
-def build_collections_db():
-    collections = requests.get(f"{BASE_URL}/collections.json").json()
-    skins       = requests.get(f"{BASE_URL}/skins.json").json()
+async def build_collections_db():
+    # Stack 100% async httpx - coherent avec le reste du projet
+    async with httpx.AsyncClient() as client:
+        collections_r = await client.get(f"{BASE_URL}/collections.json")
+        skins_r       = await client.get(f"{BASE_URL}/skins.json")
+
+    collections = collections_r.json()
+    skins       = skins_r.json()
 
     # Indexer les skins par id
     skins_idx = {s["id"]: s for s in skins}
@@ -235,6 +279,9 @@ def build_collections_db():
             outputs = get_output_pool(collection, skin["rarity"]["id"])
             for output in outputs:
                 store_tradeup_link(skin["id"], output["id"])
+
+# Appel depuis main.py via APScheduler:
+# scheduler.add_job(build_collections_db, "interval", weeks=1)
 ```
 
 #### Schéma de base de données
@@ -279,6 +326,25 @@ opportunities: id, combo_hash,
                high_volatility,        -- flag volatilité 24h
                kontract_score,         -- score composite final
                created_at
+
+-- Suivi du panier en cours
+trade_up_baskets : id, user_id, opportunity_id,
+                   n_required,           -- 10 ou 5 (Covert)
+                   status,               -- "in_progress" | "ready" | "detected" | "executed" | "abandoned"
+                   inventory_snapshot,   -- JSON : état inventaire Steam avant trade-up (OutputDetector)
+                   output_detected,      -- market_hash_name de l'output auto-détecté
+                   output_float,         -- float de l'output détecté
+                   output_wear,          -- FN / MW / FT / WW / BS
+                   created_at, updated_at
+
+basket_items     : id, basket_id,
+                   market_hash_name,
+                   assetid,              -- NULL si déclaré avant d'être dans l'inventaire
+                   float_value,
+                   float_norm,           -- précalculé
+                   price_paid,
+                   source,               -- "manual" | "steam_inventory" | "skinport_webhook"
+                   acquired_at
 ```
 
 ---
@@ -719,21 +785,15 @@ def get_input_price(skin_items: dict) -> float:
         return None             # skin sans prix → exclu du scan
 ```
 
-| Plateforme | Frais acheteur | Impact sur EV | Disponible MVP |
-|-----------|---------------|--------------|----------------|
-| Skinport | 5% | Référence | ✓ |
-| Steam Market | 15% | −10% sur l'EV nette | ✓ |
-| BUFF163 | 2.5% | +2.5% sur l'EV nette | Phase 2 |
+| Plateforme | Frais acheteur | Frais vendeur | Impact coût inputs | Disponible MVP |
+|-----------|---------------|--------------|-------------------|----------------|
+| Skinport | **0%** | 3% | Référence | ✓ |
+| Steam Market | 0% | 15% | Identique Skinport côté achat | ✓ |
+| BUFF163 | 2.5% | 2.5% | +2.5% sur le coût inputs | Phase 2 |
 
-L'impact est direct. Sur un panier d'inputs à 100€ de prix marché :
+> ⚠️ Sur Skinport et Steam Market, les frais sont intégralement côté vendeur. L'acheteur paie exactement le prix affiché. Sur BUFF163, l'acheteur paie le prix affiché + 2.5%.
 
-```
-Achat Skinport  : cout_ajuste = 100 × (1 - 0.05) = 95.00€
-Achat Steam     : cout_ajuste = 100 × (1 - 0.15) = 85.00€
-Achat BUFF163   : cout_ajuste = 100 × (1 - 0.025) = 97.50€
-```
-
-Acheter sur Steam plutôt que BUFF163 coûte effectivement 12.5€ de plus sur 100€ d'inputs — une différence qui peut transformer une opportunité profitable en perte nette.
+L'avantage de BUFF163 est sur le **prix de marché** (15–30% moins cher que Steam), pas sur les frais. Sur un panier à 70€ sur BUFF163 vs 100€ sur Skinport : coût BUFF163 = 71.75€ vs 100€ → économie réelle ~28€ sur ce panier.
 
 ---
 
@@ -786,6 +846,263 @@ ev_crafted, roi_crafted = calculate_ev(
 Le dashboard affiche les deux résultats côte à côte. L'utilisateur choisit selon son budget et son appétit pour la stratégie avancée.
 
 > Le float crafting est hors scope MVP. Il est intégré en V2 avec les données de float min/max issues de ByMykel `skins.json`.
+
+---
+
+#### Système de filtrage et score hybride des listings
+
+Pour chaque opportunité, le scanner évalue chaque listing disponible sur Skinport en deux étapes séquentielles : **filtres éliminatoires** (binaires, pas de score) puis **score hybride** (uniquement pour les listings qui passent tous les filtres).
+
+---
+
+##### Étape 1 — Filtres éliminatoires (hard filters)
+
+Un listing qui échoue à l'un de ces filtres est **rejeté immédiatement** — il n'entre pas dans le calcul du score hybride. Ces filtres ne sont pas configurables car ils correspondent à des règles absolues.
+
+```python
+def apply_hard_filters(listing: dict, target: dict) -> tuple[bool, str]:
+    """
+    Retourne (True, None) si le listing passe tous les filtres.
+    Retourne (False, "raison") sinon.
+    Les filtres sont appliqués dans l'ordre du plus rapide au plus lent.
+    """
+
+    # F1 — Souvenir interdit (règle Valve absolue)
+    if listing.get("souvenir"):
+        return False, "souvenir_interdit"
+
+    # F2 — Cohérence StatTrak avec le panier
+    if listing.get("stattrak") != target["stattrak"]:
+        return False, "stattrak_incoherent"
+
+    # F3 — Trade lock (Skinport garantit 0j, vérification de sécurité)
+    if listing.get("lock_days", 0) > 0:
+        return False, f"trade_lock_{listing['lock_days']}j"
+
+    # F4 — Sticker de valeur (ne pas détruire un sticker rare)
+    if has_valuable_sticker(listing.get("stickers", [])):
+        return False, "sticker_precieux"
+
+    # F5 — Pattern premium (Case Hardened bleu, Fade, etc.)
+    if has_premium_pattern(listing["name"], listing.get("pattern")):
+        return False, "pattern_premium"
+
+    # F6 — Prix aberrant (anomalie de listage)
+    if is_price_anomaly(listing["price"], target["median_price"]):
+        return False, "prix_aberrant"
+
+    # F7 — Hors budget maximum configuré par l'utilisateur
+    if listing["price"] > target["max_input_price"]:
+        return False, "hors_budget"
+
+    # F8 — Float hors plage cible (si float crafting activé)
+    if target.get("float_crafting") and listing.get("float_norm") is not None:
+        norm = listing["float_norm"]
+        if not (target["norm_min"] <= norm <= target["norm_max"]):
+            return False, f"float_hors_plage_{norm:.3f}"
+
+    return True, None
+```
+
+---
+
+##### Étape 2 — Score hybride (soft score)
+
+Pour les listings qui passent tous les hard filters, un score composite de 0 à 100 est calculé. Plus le score est élevé, plus le listing est optimal à acheter.
+
+```python
+def calculate_listing_score(listing: dict, target: dict, panier_state: dict) -> dict:
+    """
+    Score hybride 0–100 pour un listing qui a passé les hard filters.
+
+    Dimensions :
+    - Prix (40%)     : économie vs médiane + économie vs panier actuel
+    - Float (35%)    : précision par rapport à la contribution marginale requise
+    - Qualité (15%)  : absence de stickers, pattern neutre, homogénéité
+    - Disponibilité (10%) : trade lock résiduel, fraîcheur du listing
+    """
+
+    # ── DIMENSION PRIX (40%) ──────────────────────────────────────────
+
+    # Économie vs médiane (0 à 1 : plus négatif = meilleur)
+    median        = target["median_price"]
+    price         = listing["price"]
+    price_saving  = (median - price) / median          # positif = en dessous médiane
+    price_score   = min(1.0, max(0.0, 0.5 + price_saving * 2))
+    # −20% vs médiane → score 0.90 | +10% → score 0.30 | au niveau médiane → 0.50
+
+    # Économie marginale dans le panier (ce listing améliore-t-il le coût moyen ?)
+    current_avg   = panier_state.get("avg_price", median)
+    marginal_gain = (current_avg - price) / current_avg if current_avg > 0 else 0
+    marginal_score = min(1.0, max(0.0, 0.5 + marginal_gain * 3))
+
+    prix_final = 0.65 * price_score + 0.35 * marginal_score
+
+    # ── DIMENSION FLOAT (35%) ─────────────────────────────────────────
+
+    if listing.get("float_norm") is not None and target.get("float_crafting"):
+        float_norm     = listing["float_norm"]
+        norm_center    = (target["norm_min"] + target["norm_max"]) / 2
+        norm_range     = target["norm_max"] - target["norm_min"]
+
+        # Précision par rapport au centre de la plage cible
+        distance       = abs(float_norm - norm_center)
+        precision      = max(0.0, 1.0 - (distance / (norm_range / 2)))
+
+        # Contribution marginale : est-ce que ce float amène le panier
+        # vers l'objectif ou l'en éloigne ?
+        required_min, required_max, required_center = \
+            required_float_norm_remaining(
+                panier_state.get("floats_bought", []),
+                target["norm_min"],
+                target["norm_max"]
+            )
+        marginal_float = max(0.0, 1.0 - abs(float_norm - required_center))
+
+        float_final = 0.5 * precision + 0.5 * marginal_float
+
+    else:
+        # Pas de float crafting → float neutre, score 0.7 (légèrement positif)
+        float_final = 0.7
+
+    # ── DIMENSION QUALITÉ (15%) ───────────────────────────────────────
+
+    # Homogénéité avec les floats déjà achetés
+    floats_bought = panier_state.get("floats_bought", [])
+    if floats_bought and listing.get("float_norm"):
+        avg_bought   = sum(floats_bought) / len(floats_bought)
+        homogeneity  = max(0.0, 1.0 - abs(listing["float_norm"] - avg_bought) * 5)
+    else:
+        homogeneity = 1.0
+
+    # Absence de stickers (même non précieux, préférer listing propre)
+    sticker_count  = len(listing.get("stickers", []))
+    sticker_score  = 1.0 if sticker_count == 0 else max(0.5, 1.0 - sticker_count * 0.1)
+
+    qualite_final  = 0.6 * homogeneity + 0.4 * sticker_score
+
+    # ── DIMENSION DISPONIBILITÉ (10%) ─────────────────────────────────
+
+    # Fraîcheur du listing (listed récemment = plus de chance d'être encore dispo)
+    age_minutes    = listing.get("age_minutes", 60)
+    freshness      = max(0.0, 1.0 - age_minutes / 120)  # 0 = 2h+, 1 = instantané
+
+    # Pas de trade lock résiduel (Skinport = 0j normalement)
+    lock_score     = 1.0 if listing.get("lock_days", 0) == 0 else 0.5
+
+    dispo_final    = 0.7 * freshness + 0.3 * lock_score
+
+    # ── SCORE FINAL ───────────────────────────────────────────────────
+
+    score = (
+        0.40 * prix_final    +
+        0.35 * float_final   +
+        0.15 * qualite_final +
+        0.10 * dispo_final
+    ) * 100
+
+    return {
+        "score":           round(score, 1),
+        "prix_score":      round(prix_final * 100, 1),
+        "float_score":     round(float_final * 100, 1),
+        "qualite_score":   round(qualite_final * 100, 1),
+        "dispo_score":     round(dispo_final * 100, 1),
+        "price_saving_pct": round(price_saving * 100, 1),
+        "float_norm":      listing.get("float_norm"),
+        "recommended":     score >= 60,
+        "url":             build_listing_url(listing),
+        "inspect_link":    listing.get("link"),
+    }
+```
+
+---
+
+##### Pipeline complet — de la liste brute aux meilleurs listings
+
+```python
+def rank_input_listings(
+    raw_listings: list,
+    target: dict,
+    panier_state: dict,
+    top_n: int = 5
+) -> dict:
+    """
+    Pipeline complet : filtre → score → classement.
+    Retourne les top_n meilleurs listings + les statistiques de filtrage.
+    """
+    rejected = []
+    candidates = []
+
+    # Étape 1 : filtres éliminatoires
+    for listing in raw_listings:
+        passed, reason = apply_hard_filters(listing, target)
+        if passed:
+            candidates.append(listing)
+        else:
+            rejected.append({"listing": listing, "reason": reason})
+
+    # Étape 2 : score hybride
+    scored = []
+    for listing in candidates:
+        result = calculate_listing_score(listing, target, panier_state)
+        scored.append({**listing, **result})
+
+    # Étape 3 : classement par score décroissant
+    ranked = sorted(scored, key=lambda x: -x["score"])
+
+    # Statistiques de filtrage
+    rejection_summary = {}
+    for r in rejected:
+        reason = r["reason"].split("_")[0]  # grouper par catégorie
+        rejection_summary[reason] = rejection_summary.get(reason, 0) + 1
+
+    return {
+        "top_listings":       ranked[:top_n],
+        "total_available":    len(raw_listings),
+        "passed_filters":     len(candidates),
+        "rejected":           len(rejected),
+        "rejection_summary":  rejection_summary,
+        "best_score":         ranked[0]["score"] if ranked else 0,
+        "panier_completable": len(candidates) >= (10 - panier_state.get("n_bought", 0)),
+    }
+```
+
+---
+
+##### Tableau des pondérations du score hybride
+
+| Dimension | Poids | Critères inclus | Raisonnement |
+|-----------|-------|----------------|--------------|
+| Prix | 40% | Économie vs médiane + gain marginal panier | Impacte directement l'EV calculée |
+| Float | 35% | Précision plage cible + contribution marginale | Détermine la condition de wear de l'output |
+| Qualité | 15% | Homogénéité panier + absence stickers | Réduit le risque et la variance |
+| Disponibilité | 10% | Fraîcheur du listing + trade lock | Exécutabilité immédiate |
+
+> **Note** : si le float crafting est désactivé (stratégie `cheapest`), la dimension Float passe à 0.7 fixe et le poids restant est redistribué sur le Prix (+15%). Seul le prix et la qualité discriminent alors.
+
+---
+
+##### Exemple de sortie dashboard
+
+```
+FAMAS | Rapid Eye Movement MW — 18 listings analysés
+✅ Passé les filtres : 14  |  ❌ Rejetés : 4
+  Rejetés → sticker_precieux: 1 | prix_aberrant: 2 | float_hors_plage: 1
+
+┌─────────────────────────────────────────────────────────────────┐
+│ # │ Score │ Prix  │ Float  │ Prix% │ Float% │ Qualité │ Action  │
+├───┼───────┼───────┼────────┼───────┼────────┼─────────┼─────────┤
+│ 1 │  84.2 │ 7.93€ │ 0.1430 │  92.0 │   81.0 │    88.0 │ 🛒 BUY  │
+│ 2 │  79.5 │ 7.95€ │ 0.1460 │  91.5 │   78.5 │    86.0 │ 🛒 BUY  │
+│ 3 │  71.3 │ 8.00€ │ 0.1370 │  88.5 │   72.0 │    90.0 │ ✅ OK   │
+│ 4 │  68.9 │ 8.00€ │ 0.1440 │  88.5 │   69.0 │    85.0 │ ✅ OK   │
+│ 5 │  51.2 │ 8.47€ │ 0.1460 │  70.0 │   78.5 │    72.0 │ ⚠️ SKIP │
+└─────────────────────────────────────────────────────────────────┘
+
+Panier : 0/10 inputs | Budget restant : 100€
+Float moyen après achat top-3 : norm ~0.87 → Output prédit : BS
+→ Pour viser FT sur l'output, acheter des MW float < 0.09
+```
 
 ---
 
@@ -855,6 +1172,306 @@ def validate_tradeup(inputs: list, output_target: dict) -> tuple[bool, str]:
         return False, "covert_requires_5_inputs"
 
     return True, "valid"
+```
+
+---
+
+### 4.4.2 Module — Suivi du panier en cours (PanierState)
+
+#### Problème
+
+Le score hybride des listings et le calcul du float marginal requis dépendent de ce que l'utilisateur a **déjà acheté**. Sans connaissance de l'état du panier, il est impossible de :
+- Calculer le float contribution marginale exacte pour les inputs restants
+- Afficher le budget restant
+- Prédire la condition de wear finale de l'output
+- Alerter l'utilisateur quand le panier est complet et le trade-up exécutable
+
+#### Trois sources de vérité — par ordre de fiabilité
+
+| Source | Fiabilité | Délai | Auth requise | Scope MVP |
+|--------|-----------|-------|--------------|-----------|
+| Déclaration manuelle | Dépend utilisateur | Immédiat | Non | ✓ |
+| Inventaire Steam API | Haute | ~30 sec | Non (inventaire public) | ✓ V1 |
+| Transactions Skinport API | Exacte | ~1 min | Oui (API key) | V2 |
+
+---
+
+#### Déclaration manuelle — commandes Telegram
+
+```
+/panier add <skin_name> float=<val> prix=<val>
+  → Ajoute un input déclaré manuellement
+
+/panier status
+  → Affiche l'état du panier + float requis pour les restants
+
+/panier remove <n>
+  → Retire l'input n° n du panier
+
+/panier reset
+  → Remet le panier à zéro
+```
+
+---
+
+#### Synchronisation inventaire Steam (V1)
+
+```python
+async def fetch_steam_inventory(steamid: str) -> list:
+    """
+    Récupère l'inventaire CS2 public d'un compte Steam.
+    Aucune auth requise si l'inventaire est public.
+    Rate limit : ~1 requête/minute recommandé pour éviter le throttling Steam.
+    """
+    url = (
+        f"https://steamcommunity.com/inventory/{steamid}/730/2"
+        f"?l=english&count=5000"
+    )
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, timeout=15)
+        data = r.json()
+
+    items = []
+    descs = {
+        f"{d['classid']}_{d['instanceid']}": d
+        for d in data.get("descriptions", [])
+    }
+    for asset in data.get("assets", []):
+        key  = f"{asset['classid']}_{asset['instanceid']}"
+        desc = descs.get(key, {})
+        # Extraire le lien inspect depuis les actions Steam
+        inspect_link = next(
+            (a["link"].replace("%owner_steamid%", steamid)
+                      .replace("%assetid%", asset["assetid"])
+             for a in desc.get("actions", [])
+             if "inspect" in a.get("name", "").lower()),
+            None
+        )
+        items.append({
+            "assetid":          asset["assetid"],
+            "market_hash_name": desc.get("market_hash_name"),
+            "tradable":         desc.get("tradable", 0) == 1,
+            "inspect_link":     inspect_link,
+        })
+    return items
+
+
+async def get_float_from_inspect(inspect_link: str) -> float | None:
+    """
+    Récupère le float d'un item via son lien inspect.
+    Utilise l'API publique CSFloat (gratuite, rate limit ~100 req/heure).
+    """
+    if not inspect_link:
+        return None
+    url = f"https://api.csfloat.com/?url={inspect_link}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    return data.get("iteminfo", {}).get("floatvalue")
+```
+
+---
+
+#### Classe PanierState — source de vérité unifiée
+
+```python
+class PanierState:
+    """
+    État du panier en cours pour un trade-up donné.
+    Source de vérité unifiée : déclarations manuelles + inventaire Steam.
+    Persisté en BDD (table basket_items) et mis à jour à chaque action.
+    """
+
+    def __init__(self, opportunity_id: str, user_id: str, n_required: int = 10):
+        self.opportunity_id = opportunity_id
+        self.user_id        = user_id
+        self.n_required     = n_required
+        self.inputs_bought  = []
+        # [{market_hash_name, float_value, price_paid, source, assetid, acquired_at}]
+
+    # ── Ajout d'un input ──────────────────────────────────────────────
+
+    def add_manual(self, skin_name: str, float_val: float, price: float):
+        """Déclaration manuelle via commande Telegram /panier add."""
+        self.inputs_bought.append({
+            "market_hash_name": skin_name,
+            "float_value":      float_val,
+            "price_paid":       price,
+            "source":           "manual",
+            "assetid":          None,
+            "acquired_at":      datetime.utcnow(),
+        })
+
+    async def sync_from_inventory(self, steamid: str, target_skins: list):
+        """
+        Synchronise avec l'inventaire Steam.
+        Identifie automatiquement les inputs déjà présents dans l'inventaire.
+        Appelle CSFloat uniquement pour les items non encore trackés.
+        """
+        inventory = await fetch_steam_inventory(steamid)
+        for item in inventory:
+            if item["market_hash_name"] not in target_skins:
+                continue
+            if self._already_tracked(item["assetid"]):
+                continue
+            # Récupérer le float via CSFloat
+            float_val = await get_float_from_inspect(item["inspect_link"])
+            self.inputs_bought.append({
+                "market_hash_name": item["market_hash_name"],
+                "float_value":      float_val,
+                "price_paid":       None,    # prix inconnu via inventaire seul
+                "source":           "steam_inventory",
+                "assetid":          item["assetid"],
+                "acquired_at":      datetime.utcnow(),
+            })
+
+    # ── Propriétés calculées ─────────────────────────────────────────
+
+    @property
+    def n_bought(self) -> int:
+        return len(self.inputs_bought)
+
+    @property
+    def n_remaining(self) -> int:
+        return self.n_required - self.n_bought
+
+    @property
+    def is_complete(self) -> bool:
+        return self.n_remaining == 0
+
+    @property
+    def floats_bought(self) -> list:
+        return [i["float_value"] for i in self.inputs_bought
+                if i["float_value"] is not None]
+
+    @property
+    def avg_float_norm_current(self) -> float | None:
+        return sum(self.floats_bought) / len(self.floats_bought) \
+               if self.floats_bought else None
+
+    @property
+    def avg_price_bought(self) -> float:
+        prices = [i["price_paid"] for i in self.inputs_bought
+                  if i["price_paid"] is not None]
+        return sum(prices) / len(prices) if prices else 0
+
+    @property
+    def total_spent(self) -> float:
+        return sum(i["price_paid"] for i in self.inputs_bought
+                   if i["price_paid"] is not None)
+
+    def required_float_norm_remaining(
+        self,
+        target_norm_min: float,
+        target_norm_max: float
+    ) -> tuple:
+        """
+        Calcule le float normalisé requis pour les inputs restants
+        afin que la moyenne finale reste dans la plage cible.
+        Recalculé dynamiquement à chaque ajout d'input.
+        """
+        if not self.floats_bought:
+            return (target_norm_min, target_norm_max,
+                    (target_norm_min + target_norm_max) / 2)
+
+        n           = self.n_required
+        n_remaining = self.n_remaining
+        sum_bought  = sum(self.floats_bought)
+        target_ctr  = (target_norm_min + target_norm_max) / 2
+
+        avg_req  = (n * target_ctr - sum_bought) / n_remaining
+        avg_min  = (n * target_norm_min - sum_bought) / n_remaining
+        avg_max  = (n * target_norm_max - sum_bought) / n_remaining
+
+        return (max(0.0, avg_min), min(1.0, avg_max), avg_req)
+
+    def predict_output_float(self, output_skin: dict) -> float | None:
+        """
+        Prédit le float de l'output si tous les inputs restants
+        ont le float normalisé optimal (centre de la plage cible).
+        """
+        if not self.floats_bought:
+            return None
+        # Hypothèse : les restants achètent exactement le float requis
+        _, _, req_center = self.required_float_norm_remaining(0.0, 1.0)
+        avg_all_norm = (
+            sum(self.floats_bought) + req_center * self.n_remaining
+        ) / self.n_required
+        f_min = output_skin["float_min"]
+        f_max = output_skin["float_max"]
+        return f_min + avg_all_norm * (f_max - f_min)
+
+    def _already_tracked(self, assetid: str) -> bool:
+        return any(i["assetid"] == assetid for i in self.inputs_bought
+                   if i["assetid"])
+```
+
+---
+
+#### Schéma BDD — tables panier
+
+```sql
+-- Panier en cours par opportunité et utilisateur
+trade_up_baskets :
+    id              UUID PRIMARY KEY,
+    user_id         UUID REFERENCES users(id),
+    opportunity_id  UUID REFERENCES opportunities(id),
+    n_required      INTEGER DEFAULT 10,
+    status          TEXT,   -- "in_progress" | "ready" | "executed" | "abandoned"
+    created_at      TIMESTAMP,
+    updated_at      TIMESTAMP
+
+-- Items du panier (un par input acheté)
+basket_items :
+    id               UUID PRIMARY KEY,
+    basket_id        UUID REFERENCES trade_up_baskets(id),
+    market_hash_name TEXT NOT NULL,
+    assetid          TEXT,               -- NULL si déclaré avant d'être dans l'inventaire
+    float_value      DECIMAL(10, 8),
+    float_norm       DECIMAL(10, 8),     -- précalculé
+    price_paid       DECIMAL(10, 2),
+    source           TEXT,               -- "manual" | "steam_inventory" | "skinport_webhook"
+    acquired_at      TIMESTAMP
+```
+
+---
+
+#### Notification Telegram — état du panier
+
+À chaque mise à jour du panier, l'utilisateur reçoit un récapitulatif :
+
+```
+📦 Panier mis à jour — FAMAS REM → AWP Fever Dream FN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Progression : 3/10 inputs ✓
+Dépensé    : 23.81€ | Restant : 76.19€
+
+Inputs confirmés :
+  ✓ FAMAS REM MW  0.143  7.93€  (Steam)
+  ✓ FAMAS REM MW  0.146  7.95€  (Steam)
+  ✓ FAMAS REM MW  0.137  7.93€  (Steam)
+
+Float actuel  : avg_norm = 0.880
+Float requis  : norm 0.76–0.89 pour les 7 restants
+Output prédit : Field-Tested ✓
+
+→ Prochain listing recommandé (score 84.2) :
+  7.93€ | float 0.143 | norm 0.880
+  🛒 https://skinport.com/item/famas-rapid-eye-movement/6934215
+```
+
+Quand le panier est complet :
+
+```
+✅ Panier complet — Trade-up prêt à exécuter !
+10/10 inputs dans l'inventaire ✓
+Float output prédit : 0.247 → Field-Tested ✓
+EV nette estimée    : +14.20€ (+18% ROI)
+Kontract Score      : 24.7
+
+→ Exécuter maintenant dans CS2 : Inventaire → Trade Up Contract
 ```
 
 ---
@@ -1430,6 +2047,687 @@ Le risque Valve est existentiel et non modélisable. La MAJ octobre 2025 a effac
 
 ---
 
+### 4.7.1 Décision d'abandon de panier
+
+La décision d'abandonner un panier en cours est délicate : on a déjà dépensé de l'argent (inputs achetés), et l'abandon implique de revendre ces inputs avec une perte potentielle. Le principe est de comparer **le coût de l'abandon** (perte certaine maintenant) vs **l'EV si on continue** (gain espéré mais incertain).
+
+```python
+def should_abandon_basket(
+    basket_state:    "PanierState",
+    opportunity:     dict,
+    min_score:       float = 5.0,
+    prices:          dict  = None
+) -> tuple[bool, str]:
+    """
+    Décide si un panier en cours doit être abandonné.
+    Compare le coût de la revente forcée vs l'EV restante.
+
+    Retourne (True, raison) si l'abandon est recommandé.
+    """
+    current_score = opportunity.get("kontract_score", 0)
+
+    # Cas 1 : score encore au-dessus du seuil → continuer
+    if current_score >= min_score:
+        return False, "score_ok"
+
+    # Cas 2 : panier vide → abandonner sans frais
+    if basket_state.n_bought == 0:
+        return True, "score_bas_panier_vide"
+
+    # Cas 3 : calculer le coût réel de l'abandon
+    resell_value = 0.0
+    if prices:
+        for item in basket_state.inputs_bought:
+            skin_data   = prices.get(item["market_hash_name"], {})
+            market_price = skin_data.get("min_price") or skin_data.get("median_price", 0)
+            # Frais vendeur Skinport 3%
+            resell_value += market_price * (1 - FEES["skinport"]["seller"])
+
+    total_spent   = basket_state.total_spent
+    abandon_loss  = total_spent - resell_value
+    ev_remaining  = opportunity.get("ev_nette", 0)
+
+    # Si l'EV restante couvre la perte d'abandon → continuer malgré score bas
+    if ev_remaining > abandon_loss:
+        return False, (
+            f"ev_continue_{ev_remaining:.2f}€ > perte_abandon_{abandon_loss:.2f}€"
+        )
+
+    # Sinon → recommander l'abandon
+    return True, (
+        f"score_{current_score:.1f}_sous_seuil_{min_score} | "
+        f"perte_abandon_{abandon_loss:.2f}€ < ev_restante_{ev_remaining:.2f}€"
+    )
+```
+
+**Exemple** : panier 4/10 inputs achetés à 40€, score tombé de 14 → 6 (en dessous du seuil 8), EV nette recalculée = 2€, valeur de revente des 4 inputs = 36€.
+- Perte abandon = 40 − 36 = **4€**
+- EV restante = **2€**
+- 4€ > 2€ → **abandonner** (la perte certaine est moins grave que le risque de continuer)
+
+L'alerte Telegram envoyée à l'utilisateur :
+
+```
+⚠️ Abandon recommandé — FAMAS REM → Fever Dream
+Score passé : 14.2 → 6.3 (−56%)
+Cause : output en baisse -23% sur 7j
+
+Analyse abandon vs continuation :
+  Perte si revente maintenant : −4.20€
+  EV si on continue           : +2.10€
+  → Recommandation : ABANDONNER (économie nette : 2.10€)
+
+Confirmer : /abandon <basket_id>
+Ignorer   : /continue <basket_id>
+```
+
+---
+
+### 4.8 Module Portfolio — Gestion du portefeuille de trade-ups
+
+#### Vue d'ensemble
+
+La stratégie portefeuille consiste à gérer **plusieurs trade-ups en parallèle** — jusqu'à N paniers simultanés selon le budget disponible. Le Portfolio Engine est le chef d'orchestre : il sélectionne les opportunités, résout les conflits d'inputs, alerte en temps réel sur les meilleurs listings, et réévalue en continu.
+
+**Ce qui est automatisé à 100% :**
+- Sélection et ranking des opportunités
+- Détection des conflits d'inputs entre paniers
+- Surveillance WebSocket des listings en temps réel
+- Filtrage et scoring des listings entrants
+- Sync inventaire Steam et mise à jour des paniers
+- Réévaluation continue du Kontract Score
+- Recommandation d'abandon si score chute
+- Alerte "panier prêt" quand tous les inputs sont achetés
+
+**Ce qui reste manuel (1 clic) :**
+- L'achat sur Skinport (pas d'API d'achat disponible)
+- L'exécution du trade-up dans CS2
+
+---
+
+#### Configuration portefeuille — une seule fois
+
+```python
+PORTFOLIO_CONFIG = {
+    "bankroll":            500.0,   # budget total €
+    "max_pct_bankroll":    0.30,    # jamais > 30% engagé simultanément
+    "max_pct_per_tradeup": 0.20,    # max 20% du budget par trade-up
+    "max_simultaneous":    5,       # nombre max de paniers actifs
+    "min_roi":             0.12,    # ROI minimum 12%
+    "min_kontract_score":  8.0,     # seuil Kontract Score
+    "float_crafting":      False,   # activé en V2
+    "source_achat":        "skinport",
+    "source_vente":        "skinport",
+}
+
+# Dérivés calculés automatiquement
+max_capital_engaged  = PORTFOLIO_CONFIG["bankroll"] * PORTFOLIO_CONFIG["max_pct_bankroll"]
+max_per_tradeup      = PORTFOLIO_CONFIG["bankroll"] * PORTFOLIO_CONFIG["max_pct_per_tradeup"]
+```
+
+---
+
+#### PortfolioEngine — cycle principal
+
+```python
+class PortfolioEngine:
+    """
+    Moteur de portefeuille — tourne en continu.
+    Cycle complet toutes les 5 minutes.
+    WebSocket Skinport en temps réel pour les alertes d'achat.
+    """
+
+    async def run_cycle(self):
+        # 1. Récupérer les prix frais Skinport
+        prices, history = await fetch_skinport_prices()
+
+        # 2. Scanner toutes les opportunités qualifiées
+        all_opps = await self.scanner.scan_all(prices, history)
+        qualified = [
+            o for o in all_opps
+            if o["roi"] >= self.config["min_roi"]
+            and o["kontract_score"] >= self.config["min_kontract_score"]
+        ]
+
+        # 3. Résoudre les conflits d'inputs
+        portfolio = self.resolve_conflicts(
+            sorted(qualified, key=lambda x: -x["kontract_score"])
+        )
+
+        # 4. Gérer les paniers existants (réévaluation + abandon)
+        await self.manage_active_baskets(portfolio, prices)
+
+        # 5. Ouvrir de nouveaux paniers si slots et budget disponibles
+        await self.open_new_baskets(portfolio, prices)
+
+    def resolve_conflicts(self, opportunities: list) -> list:
+        """
+        Si deux opportunités partagent un input, prioriser la plus haute scorée.
+        La seconde est mise en attente (visible en UI mais non active).
+        """
+        allocated = {}  # skin_name → opportunity_id
+        result    = []
+
+        for opp in opportunities:
+            conflict = next(
+                (s["name"] for s in opp["inputs_required"]
+                 if s["name"] in allocated),
+                None
+            )
+            if not conflict:
+                for s in opp["inputs_required"]:
+                    allocated[s["name"]] = opp["id"]
+                opp["portfolio_status"] = "active"
+            else:
+                opp["portfolio_status"] = "waiting_conflict"
+                opp["conflict_with"]    = allocated[conflict]
+            result.append(opp)
+
+        return result[:self.config["max_simultaneous"]]
+
+    async def manage_active_baskets(self, portfolio, prices):
+        for basket in self.active_baskets:
+            # Sync inventaire Steam
+            await basket.state.sync_from_inventory(
+                steamid=basket.user.steamid,
+                target_skins=basket.opportunity["input_skin_names"]
+            )
+            # Réévaluer avec prix frais
+            opp = recalculate_opportunity(basket.opportunity, prices)
+            basket.opportunity = opp
+
+            if basket.state.is_complete:
+                await notify_basket_ready(basket)
+                basket.status = "ready"
+                continue
+
+            # Vérifier si abandon recommandé
+            should_quit, reason = should_abandon_basket(
+                basket.state, opp, self.config["min_kontract_score"]
+            )
+            if should_quit:
+                await notify_abandon_recommendation(basket, reason)
+
+    async def open_new_baskets(self, portfolio, prices):
+        capital_engaged = sum(
+            b.state.total_spent for b in self.active_baskets
+        )
+        capital_available = (
+            self.config["bankroll"] * self.config["max_pct_bankroll"]
+            - capital_engaged
+        )
+
+        for opp in portfolio:
+            if opp["portfolio_status"] != "active":
+                continue
+            if len(self.active_baskets) >= self.config["max_simultaneous"]:
+                break
+            if opp["cout_inputs_estime"] > capital_available:
+                continue
+            if self._basket_exists(opp["id"]):
+                continue
+
+            basket = await create_basket(opp, self.user)
+            self.active_baskets.append(basket)
+            capital_available -= opp["cout_inputs_estime"]
+            await notify_basket_opened(basket)
+```
+
+---
+
+#### BuyAlertEngine — alertes temps réel WebSocket
+
+```python
+class BuyAlertEngine:
+    """
+    Écoute le WebSocket Skinport.
+    Pour chaque listing, vérifie en < 500ms s'il correspond
+    à un input nécessaire dans un panier actif.
+    """
+
+    async def on_listing(self, sale: dict):
+        skin_name = sale["marketHashName"]
+        if skin_name not in self.watched_skins:
+            return  # early exit — 99% des listings ignorés
+
+        for basket in self.get_baskets_needing(skin_name):
+            passed, reason = apply_hard_filters(sale, basket.target)
+            if not passed:
+                continue
+
+            score = calculate_listing_score(sale, basket.target, basket.state)
+            if score["score"] < 60:
+                continue
+
+            urgency = "🔴 URGENT" if score["score"] >= 80 else "🟡 BON"
+            url = f"https://skinport.com/item/{sale['url']}/{sale['saleId']}"
+
+            await telegram_bot.send(basket.user_id, (
+                f"{urgency} — Input recommandé\n"
+                f"Trade-up : {basket.opportunity['name']}\n"
+                f"Score listing : {score['score']}/100\n"
+                f"\n"
+                f"Prix   : {sale['salePrice']/100:.2f}€ "
+                f"({score['price_saving_pct']:+.1f}% vs médiane)\n"
+                f"Float  : {sale.get('wear', 'N/A'):.4f} ✓\n"
+                f"Panier : {basket.state.n_bought}/"
+                f"{basket.state.n_required} inputs\n"
+                f"\n"
+                f"→ 🛒 {url}"
+            ))
+```
+
+---
+
+### 4.9 Module Exécution & Détection automatique de l'output
+
+#### Mécanique du trade-up dans CS2
+
+Quand le panier est complet, l'utilisateur exécute dans CS2 :
+1. Inventaire → onglet **Contrats**
+2. Glisser les 10 inputs dans les 10 emplacements
+3. Vérifier le float output affiché (doit correspondre à la prédiction Kontract.gg)
+4. Cliquer **"Envoyer le contrat"** → output instantané, aucun lock
+
+```
+Règles Valve :
+  - 10 inputs même tier (5 pour Covert → Couteaux/Gants)
+  - Tous StatTrak ou tous non-StatTrak
+  - Aucun Souvenir
+  - Output instantané dans l'inventaire
+```
+
+---
+
+#### Détection automatique de l'output (V1)
+
+Valve n'expose pas d'API pour détecter l'exécution. La stratégie : **comparer l'inventaire Steam avant et après** — le nouvel item qui apparaît est l'output.
+
+```python
+class OutputDetector:
+    """
+    Détecte automatiquement l'output en comparant l'inventaire
+    avant et après l'exécution. Tourne dès qu'un panier est "ready".
+    """
+
+    def __init__(self, basket: dict, steamid: str):
+        self.basket           = basket
+        self.steamid          = steamid
+        self.snapshot_before  = None
+        self.expected_outputs = [
+            o["market_hash_name"]
+            for o in basket.opportunity["outputs"]
+        ]
+
+    async def take_snapshot(self):
+        inventory = await fetch_steam_inventory(self.steamid)
+        self.snapshot_before = {item["assetid"]: item for item in inventory}
+
+    async def poll_for_output(
+        self,
+        interval_sec: int = 30,
+        timeout_sec:  int = 3600
+    ) -> dict | None:
+        """Interroge l'inventaire toutes les 30s, timeout 1h."""
+        if not self.snapshot_before:
+            await self.take_snapshot()
+
+        elapsed = 0
+        while elapsed < timeout_sec:
+            await asyncio.sleep(interval_sec)
+            elapsed += interval_sec
+            inventory_after = await fetch_steam_inventory(self.steamid)
+            output = self._compare_inventories(inventory_after)
+            if output:
+                return output
+        return None
+
+    def _compare_inventories(self, inventory_after: list) -> dict | None:
+        before_ids = set(self.snapshot_before.keys())
+        new_items  = [
+            item for item in inventory_after
+            if item["assetid"] not in before_ids
+        ]
+        for item in new_items:
+            if item["market_hash_name"] in self.expected_outputs:
+                return item
+        return None
+```
+
+---
+
+#### Pipeline post-panier-prêt
+
+```python
+async def handle_basket_ready(basket: dict, user: dict):
+    # 1. Alerte "panier prêt" + instructions CS2
+    await notify_basket_ready(basket)
+
+    # 2. Snapshot inventaire avant trade-up
+    detector = OutputDetector(basket, user["steamid"])
+    await detector.take_snapshot()
+    await db.update_basket(basket["id"], {
+        "status":             "ready",
+        "inventory_snapshot": detector.snapshot_before,
+    })
+
+    # 3. Polling détection output (tourne en background)
+    output_item = await detector.poll_for_output()
+
+    if output_item is None:
+        await telegram_bot.send(user["id"],
+            "⏱️ Trade-up non détecté après 1h.\n"
+            f"Si exécuté : /executed {basket['id']} output=<nom> float=<val>"
+        )
+        return
+
+    # 4. Float via CSFloat API
+    float_val = await get_float_from_inspect(output_item["inspect_link"])
+    wear      = get_output_wear_from_float(float_val, basket.opportunity["output_skin"])
+    full_name = f"{output_item['market_hash_name']} ({wear})"
+
+    # 5. Alerte avec pré-remplissage — 1 seul clic pour confirmer
+    await telegram_bot.send(user["id"],
+        f"🎯 Output détecté automatiquement !\n"
+        f"Item   : {full_name}\n"
+        f"Float  : {float_val:.6f} → {wear}\n"
+        f"Prédit : {basket.opportunity['predicted_wear']}\n"
+        f"\nConfirme pour enregistrer le P&L :\n"
+        f"/executed {basket['id']} auto"
+    )
+    await db.update_basket(basket["id"], {
+        "status":          "detected",
+        "output_detected": full_name,
+        "output_float":    float_val,
+        "output_wear":     wear,
+    })
+```
+
+---
+
+#### Vérification de la précision float
+
+Chaque exécution valide la formule de float crafting. Un écart systématique signale une erreur dans les données `float_min/float_max` de ByMykel.
+
+```python
+def verify_float_prediction(predicted: float, actual: float,
+                             threshold: float = 0.001) -> dict:
+    delta    = abs(actual - predicted)
+    accurate = delta <= threshold
+    return {
+        "delta":    round(delta, 6),
+        "accurate": accurate,
+        "verdict":  "✓ formule correcte" if accurate
+                    else f"⚠️ écart {delta:.6f} — vérifier float_min/max ByMykel",
+    }
+```
+
+Les résultats sont agrégés dans la page P&L → statistique "Précision float" — si elle dérive sous 95%, c'est un signal d'alerte sur la qualité des données.
+
+---
+
+### 4.10 Module P&L Tracker
+
+#### Enregistrement d'une exécution
+
+Deux modes de déclenchement :
+- **Auto** : `/executed <basket_id> auto` après détection automatique
+- **Manuel** : `/executed <basket_id> output=<n> float=<val>` si timeout
+
+```python
+async def record_execution(basket_id: str, output_name: str = None,
+                            float_val: float = None, auto: bool = False):
+    basket = await db.get_basket(basket_id)
+    opp    = basket.opportunity
+
+    if auto:
+        detected    = await db.get_detected_output(basket_id)
+        output_name = detected["output_detected"]
+        float_val   = detected["output_float"]
+
+    sell_price  = await get_current_sell_price(output_name)
+    net_revenue = sell_price * (1 - FEES["skinport"]["seller"])
+    total_cost  = basket.state.total_spent
+    pnl_euros   = net_revenue - total_cost
+    pnl_pct     = pnl_euros / total_cost * 100
+    ev_accuracy = pnl_euros / opp["ev_nette"] if opp["ev_nette"] else None
+    float_check = verify_float_prediction(opp.get("predicted_float", 0), float_val)
+
+    await db.record_pnl({
+        "basket_id":       basket_id,
+        "output_received": output_name,
+        "output_float":    float_val,
+        "output_wear":     get_output_wear_from_float(float_val, opp["output_skin"]),
+        "sell_price":      sell_price,
+        "total_cost":      total_cost,
+        "pnl_euros":       pnl_euros,
+        "pnl_pct":         pnl_pct,
+        "ev_calculated":   opp["ev_nette"],
+        "ev_accuracy":     ev_accuracy,
+        "float_predicted": opp.get("predicted_float"),
+        "float_delta":     float_check["delta"],
+        "float_accurate":  float_check["accurate"],
+        "detected_auto":   auto,
+        "executed_at":     datetime.utcnow(),
+    })
+
+    emoji = "🟢" if pnl_euros > 0 else "🔴"
+    await telegram_bot.send(basket.user_id, (
+        f"{emoji} Trade-up clôturé {'(auto)' if auto else '(manuel)'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Output  : {output_name}\n"
+        f"Float   : {float_val:.6f} — {float_check['verdict']}\n"
+        f"Vendu   : {sell_price:.2f}€\n"
+        f"Coût    : {total_cost:.2f}€\n"
+        f"P&L     : {pnl_euros:+.2f}€ ({pnl_pct:+.1f}%)\n"
+        f"EV calc : {opp['ev_nette']:+.2f}€ | Précision : {ev_accuracy*100:.0f}%"
+    ))
+```
+
+#### Tableau automatisation par phase
+
+| Étape | MVP | V1 | V2 |
+|-------|-----|----|----|
+| Détection achat Skinport | ✗ | ✗ | ✓ transactions API |
+| Item arrivé en inventaire | ✓ sync 5min | ✓ sync 5min | ✓ webhook |
+| Panier complet | ✓ auto | ✓ auto | ✓ auto |
+| Snapshot avant trade-up | ✗ | ✓ auto | ✓ auto |
+| Détection output | ✗ | ✓ polling 30s | ✓ polling 30s |
+| Float output (CSFloat) | ✗ | ✓ auto | ✓ auto |
+| Pré-remplissage /executed | ✗ | ✓ auto | ✓ auto |
+| Enregistrement P&L | Manuel | 1 clic confirm | 1 clic confirm |
+| Vérification précision float | ✗ | ✓ auto | ✓ auto |
+
+#### Schéma BDD — P&L enrichi
+
+```sql
+pnl_records :
+    id               UUID PRIMARY KEY,
+    basket_id        UUID REFERENCES trade_up_baskets(id),
+    user_id          UUID,
+    output_received  TEXT,
+    output_float     DECIMAL(10,8),
+    output_wear      TEXT,              -- FN / MW / FT / WW / BS
+    sell_price       DECIMAL(10,2),
+    total_cost       DECIMAL(10,2),
+    pnl_euros        DECIMAL(10,2),
+    pnl_pct          DECIMAL(6,2),
+    ev_calculated    DECIMAL(10,2),
+    ev_accuracy      DECIMAL(6,3),     -- 1.0 = EV parfaitement réalisée
+    float_predicted  DECIMAL(10,8),    -- float prédit par Kontract.gg
+    float_delta      DECIMAL(10,8),    -- |float_réel - float_prédit|
+    float_accurate   BOOLEAN,          -- delta <= 0.001
+    detected_auto    BOOLEAN,          -- auto ou manuel
+    executed_at      TIMESTAMP
+```
+
+### 4.10 Interface utilisateur — architecture des pages
+
+L'interface MVP (Streamlit) est organisée en **4 pages** accessibles via une sidebar. Chaque page correspond à une phase du workflow utilisateur.
+
+---
+
+#### Page 1 — Scanner (page d'accueil)
+
+Vue en temps réel de toutes les opportunités qualifiées, triées par Kontract Score décroissant.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  🎯 KONTRACT.GG          Scanner  Portfolio  Portefeuille  P&L      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  FILTRES RAPIDES                                                      │
+│  ROI min [10%▼]  Budget max [100€▼]  Pool max [5▼]  Score min [5▼]  │
+│  [✓] Exclure trending_down  [ ] Exclure haute volatilité             │
+│                                                                       │
+│  42 opportunités trouvées — Mis à jour il y a 2min                   │
+│  ⚠️ Risque Valve : toute MAJ peut invalider les opportunités          │
+│                                                                       │
+│  Score │ Trade-up                    │ROI  │Pool│Vol/j│Inputs│Action │
+│  ──────┼─────────────────────────────┼─────┼────┼─────┼──────┼────── │
+│  24.7  │ FAMAS REM → Fever Dream FN  │+18% │ 2  │ 38  │🟢 x40│ [+]  │
+│  21.3  │ AK Redline → Asiimov FT     │+22% │ 3  │ 95  │🟢 x80│ [+]  │
+│  18.9  │ M4A4 Howl in → Dragon       │+15% │ 2  │ 12  │🟡 x8 │ [+]  │
+│  ⚡16.2 │ USP Cortex → Black Tie      │+24% │ 4  │ 44  │🟢 x55│ [+]  │
+│  ...   │ ...                          │ ... │... │ ... │ ...  │ ... │
+│                                                                       │
+│  [▼ Voir détail] sur clic de ligne — décomposition complète          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**⚡ = recipe velocity alert** (inputs en hausse rapide)
+
+Clic sur une ligne → panneau de détail latéral :
+- Décomposition EV par outcome avec probabilités
+- Floor ratio, win_prob, CV pondéré
+- Listings recommandés pour les inputs (top 3 avec score)
+- Lien direct vers chaque listing Skinport
+- Bouton "Ajouter au portefeuille"
+
+---
+
+#### Page 2 — Portefeuille (gestion des paniers actifs)
+
+Vue en temps réel de tous les paniers en cours pour l'utilisateur.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  📦 PORTEFEUILLE          Scanner  Portfolio  Portefeuille  P&L      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  Budget : 423€ / 1000€ engagé (42%)  ████████░░░░░░░░░░░░░          │
+│  Slots  : 4 / 5 actifs                                               │
+│                                                                       │
+│  Score  │ Trade-up              │Panier │Budget│Statut   │Action     │
+│  ───────┼───────────────────────┼───────┼──────┼─────────┼─────────  │
+│  24.7   │ FAMAS → Fever Dream   │ 3/10  │ 24€  │🔄 achat │[Détail]  │
+│  21.3   │ AK → Asiimov FT       │ 7/10  │ 62€  │🔄 achat │[Détail]  │
+│  18.9   │ M4A4 → Dragon         │10/10  │ 98€  │✅ PRÊT  │[Exécuter]│
+│  ⚠️8.3  │ Glock → Bullet        │ 4/10  │ 38€  │⚠️ ↓score│[Abandon] │
+│                                                                       │
+│  ⚠️ Glock → Bullet : score passé 14.2 → 8.3 (-42%)                  │
+│     Perte abandon estimée : 4.20€ | EV restante : 2.80€             │
+│     → Recommandation : ABANDONNER                                    │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Clic sur "Détail" d'un panier → vue complète :
+- Liste des inputs déjà achetés (float, prix, source)
+- Float normalisé actuel + plage requise pour les restants
+- Top 3 listings recommandés en temps réel (WebSocket)
+- Prédiction du float output et condition de wear
+- Bouton "Sync inventaire Steam"
+
+Clic sur "✅ PRÊT" → instructions pour exécuter dans CS2 + bouton `/executed`
+
+---
+
+#### Page 3 — Calculateur manuel
+
+Outil libre pour calculer l'EV d'une combinaison personnalisée.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  🔢 CALCULATEUR           Scanner  Portfolio  Portefeuille  P&L      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  MODE : [Standard ▼]  [Float crafting]  [Reverse (output → inputs)] │
+│                                                                       │
+│  INPUTS (10 skins)                                                    │
+│  ┌──────────────────────────────────────────────────────────┐        │
+│  │ Skin 1 : [FAMAS Rapid Eye Movement ▼]  Float : [0.143]  │        │
+│  │ Skin 2 : [FAMAS Rapid Eye Movement ▼]  Float : [0.146]  │        │
+│  │ ...                                                       │        │
+│  └──────────────────────────────────────────────────────────┘        │
+│                                                                       │
+│  Source achat : [Skinport ▼]   Source vente : [Skinport ▼]           │
+│                                                                       │
+│  [CALCULER]                                                           │
+│                                                                       │
+│  RÉSULTATS                                                            │
+│  EV nette : +14.20€  ROI : +18%  Kontract Score : 24.7              │
+│  Float output prédit : 0.247 → Field-Tested                          │
+│  Win prob : 85%  Floor ratio : 42%                                    │
+│                                                                       │
+│  Outcomes possibles :                                                 │
+│  AWP Fever Dream FN   12% │ 42.00€ │ prob win ✓                      │
+│  AWP Fever Dream MW   88% │ 18.00€ │ prob win ✓                      │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Page 4 — P&L & Statistiques
+
+Tableau de bord de performance long terme.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  📊 P&L & STATS           Scanner  Portfolio  Portefeuille  P&L      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  RÉSUMÉ                        30 derniers jours                     │
+│  ┌──────────┬──────────┬──────────┬──────────┐                       │
+│  │ +142.30€ │  78%     │ +16.2%   │  94%     │                       │
+│  │ P&L net  │ Win rate │ ROI moy  │ Préc. EV │                       │
+│  └──────────┴──────────┴──────────┴──────────┘                       │
+│                                                                       │
+│  COURBE P&L CUMULÉ ───────────────────────────────────────────       │
+│  200│                                          ╭──                   │
+│  100│                           ╭──────────────╯                     │
+│    0│──────────────╭────────────╯                                     │
+│     Sem1         Sem2          Sem3           Sem4                    │
+│                                                                       │
+│  HISTORIQUE DES TRADES                                                │
+│  Date  │ Trade-up              │ Output   │ P&L    │ ROI  │ EV prec  │
+│  ──────┼───────────────────────┼──────────┼────────┼──────┼───────── │
+│  18/03 │ FAMAS → Fever Dream   │ FT 0.247 │+14.20€ │+18%  │ 97%     │
+│  15/03 │ AK → Asiimov          │ FT 0.285 │+22.10€ │+25%  │ 108%    │
+│  12/03 │ USP → Black Tie       │ BS 0.621 │ -3.40€ │ -4%  │ n/a     │
+│  ...                                                                  │
+│                                                                       │
+│  PRÉCISION EV                                                         │
+│  Moyenne : 94% | Min : 71% | Max : 124%                              │
+│  → Distribution centrée sur 100% = modèle bien calibré               │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Navigation et scope par phase
+
+| Page | MVP (Streamlit) | V1 | V2 (React) |
+|------|----------------|-----|------------|
+| Scanner | ✓ Complet | ✓ + filtres perso | ✓ UX améliorée |
+| Portefeuille | ✓ Basique (sync manuel) | ✓ + sync Steam auto | ✓ WebSocket temps réel |
+| Calculateur | ✓ Complet | ✓ + float crafting | ✓ |
+| P&L & Stats | ✗ (phase V1) | ✓ Table simple | ✓ Graphiques interactifs |
+
+---
+
 ## 5. Stack technique
 
 ### 5.1 Composants recommandés
@@ -1447,6 +2745,9 @@ Le risque Valve est existentiel et non modélisable. La MAJ octobre 2025 a effac
 | Paiements | Stripe | — | Abonnements récurrents, portail client self-serve |
 | Alertes Telegram | python-telegram-bot | 20+ | Librairie officielle Telegram, stable |
 | Compression | brotli (Python) | 1.0+ | Obligatoire pour décoder les réponses Skinport /v1/items |
+| WebSocket client | python-socketio | 5+ | Client WebSocket Skinport `saleFeed` (transport socket.io) |
+| WebSocket parser | msgpack / socketio-msgpack | — | Parser custom obligatoire pour le WebSocket Skinport |
+| Float API | httpx → api.csfloat.com | — | Récupération float exact via liens inspect Steam (V1) |
 | Déploiement | Railway | — | ~7$/mois, zero DevOps, déploiement GitHub auto |
 | Monitoring | Sentry + UptimeRobot | — | Alertes erreurs + downtime, gratuits aux seuils MVP |
 
@@ -1477,23 +2778,42 @@ async with httpx.AsyncClient() as client:
 ```
 kontract/
 ├── data/
-│   ├── models.py          # SQLAlchemy : Collection, Skin, Price, Opportunity
-│   ├── bymykel.py         # Chargement + MAJ hebdo BDD depuis ByMykel API
-│   └── database.py        # Connexion SQLite/PostgreSQL + Redis
+│   ├── models.py            # SQLAlchemy : Collection, Skin, Price, Opportunity,
+│   │                        #   Basket, BasketItem, PnlRecord
+│   ├── bymykel.py           # Chargement + MAJ hebdo BDD depuis ByMykel API
+│   └── database.py          # Connexion SQLite/PostgreSQL + Redis
 ├── fetcher/
-│   ├── skinport.py        # Client Skinport API async (items + history)
-│   └── steam.py           # Client Steam Market API (prix référence)
+│   ├── skinport_rest.py     # Client Skinport REST API async (items + history)
+│   ├── skinport_ws.py       # Client WebSocket Skinport (saleFeed, socket.io + msgpack)
+│   ├── steam.py             # Inventaire Steam + Steam Market API
+│   └── csfloat.py           # Récupération float via CSFloat API (inspect links)
 ├── engine/
-│   ├── ev_calculator.py   # Formule EV + float crafting
-│   └── scanner.py         # Scan vectorisé NumPy, filtres, scoring
+│   ├── ev_calculator.py     # Formule EV post-oct 2025 + float-conditional EV
+│   ├── scanner.py           # Scan vectorisé NumPy, filtres, scoring
+│   ├── kontract_score.py    # Kontract Score v3 (Sharpe ratio, floor, hold discount)
+│   └── filters.py           # Hard filters + score hybride listings (inputs)
+├── basket/
+│   ├── panier_state.py      # Classe PanierState — suivi panier en cours
+│   ├── output_detector.py   # OutputDetector — snapshot + polling inventaire
+│   └── abandon.py           # should_abandon_basket() — logique d'abandon
+├── portfolio/
+│   ├── portfolio_engine.py  # PortfolioEngine — cycle 5min, conflits, slots
+│   └── buy_alert_engine.py  # BuyAlertEngine — WebSocket → alertes < 500ms
+├── pnl/
+│   └── tracker.py           # record_execution(), verify_float_prediction()
 ├── alerts/
-│   ├── telegram_bot.py    # Bot Telegram + commandes /config /pause /resume
-│   └── notifier.py        # Match opportunités ↔ profils utilisateurs
+│   ├── telegram_bot.py      # Bot Telegram + commandes /config /panier /executed
+│   └── notifier.py          # Match opportunités ↔ profils utilisateurs
 ├── ui/
-│   └── dashboard.py       # Streamlit : tableau opps, filtres, détail
+│   ├── pages/
+│   │   ├── scanner.py       # Page 1 — Scanner + filtres + détail opportunité
+│   │   ├── portefeuille.py  # Page 2 — Paniers actifs + listings recommandés
+│   │   ├── calculateur.py   # Page 3 — Calculateur manuel + float crafting
+│   │   └── pnl.py           # Page 4 — Historique trades + stats + courbe P&L
+│   └── dashboard.py         # Streamlit app root + sidebar navigation
 ├── auth/
-│   └── supabase.py        # OAuth Steam + gestion sessions
-└── main.py                # APScheduler + orchestration + startup
+│   └── supabase.py          # OAuth Steam + gestion sessions
+└── main.py                  # APScheduler + WebSocket + orchestration + startup
 ```
 
 ---
@@ -1504,10 +2824,10 @@ kontract/
 
 | Phase | Durée | Livrables techniques | Sources données | Go-live |
 |-------|-------|---------------------|----------------|---------|
-| **MVP** | 3 semaines | BDD ByMykel + Skinport fetcher + moteur EV + bot Telegram + Streamlit | ByMykel + Skinport + Steam | Semaine 3 |
-| **V1 — Lancement** | 3 semaines | Auth Supabase+Steam, Stripe Free/Trader/Pro, filtres perso, calculateur manuel | Idem MVP | Semaine 6 |
-| **V2 — Croissance** | 4 semaines | BUFF163 scraping direct, float crafting dans EV, React dashboard, API Pro | + BUFF163 direct | Semaine 10 |
-| **V3 — Expansion** | Continu | Pricempire API si besoin, StatTrak, mobile, ML, Rust/Dota 2 | + Pricempire si MRR > 1 800€ | Semaine 16+ |
+| **MVP** | 3 semaines | BDD ByMykel + Skinport REST fetcher + moteur EV + Kontract Score + hard filters + score hybride listings + bot Telegram + Streamlit 4 pages (Scanner, Portefeuille basique, Calculateur) + PanierState déclaration manuelle + Portfolio Engine (sélection top 10, conflits, alertes WebSocket) | ByMykel + Skinport + Steam | Semaine 3 |
+| **V1 — Lancement** | 3 semaines | Auth Supabase+Steam + OAuth Steam, Stripe Free/Trader/Pro, sync inventaire Steam automatique, OutputDetector + polling, CSFloat float auto, P&L Tracker + page P&L, should_abandon_basket() opérationnel, vérification précision float | + Steam Inventory API + CSFloat | Semaine 6 |
+| **V2 — Croissance** | 4 semaines | Float-conditional EV, BUFF163 scraping direct, React dashboard, Kelly Criterion UI, multi-sourcing inputs, Pricempire si MRR > 1 800€ | + BUFF163 direct | Semaine 10 |
+| **V3 — Expansion** | Continu | StatTrak dédié, mobile, ML prédiction prix, Rust/Dota 2 | + Pricempire si besoin | Semaine 16+ |
 
 > **Conseil démarrage** : Commencer par `bymykel.py` (semaine 1) : télécharger `collections.json` + `skins.json`, construire la BDD SQLite et vérifier que le pool d'outputs est correct sur 5–10 collections manuellement. C'est la fondation de tout le moteur EV.
 
@@ -1519,7 +2839,8 @@ kontract/
 | **S2** | Agrégateur complet Skinport (items + history) avec cache Redis. Moteur EV en ligne de commande. Tests sur 20 trade-ups réels — vérification cohérence EV calculée vs prix marché. | Contacter 10 beta testeurs Discord. Enregistrer kontract.gg sur Porkbun (~52$/an). Préparer 3 posts éducatifs Reddit. |
 | **S3** | Bot Telegram fonctionnel + commandes `/config` `/pause` `/resume`. Dashboard Streamlit. Déploiement Railway. Gestion utilisateurs basique. | Lancement beta privée 10 users. Collecte feedback structuré. Page kontract.gg en ligne. |
 | **S4** | Stripe Free/Trader/Pro. Alertes Telegram configurables. Calculateur manuel. Reverse finder (output → inputs optimaux). | Premier post Reddit public. Approcher 3 créateurs contenu CS2 pour affiliation. |
-| **S5–S8** | BUFF163 scraping direct, float crafting dans EV, React V2. | Affiliation 20–30%, SEO, Discord CS2 servers, optimisation conversion. |
+| **S5–S6** | Sync inventaire Steam + OAuth V1. OutputDetector + CSFloat. P&L Tracker. Page P&L Streamlit. should_abandon_basket() activé. | Premiers témoignages utilisateurs. Mise en avant P&L comme preuve sociale. |
+| **S7–S8** | Float crafting V2 (float-conditional EV). BUFF163 scraping. Kelly Criterion dans l'UI. | Affiliation 20–30%, SEO, Discord CS2 servers, optimisation conversion. |
 
 ---
 
@@ -1534,21 +2855,28 @@ kontract/
 | Concurrent clône Kontract.gg | Modérée | Modéré | Pool score + liquidité = différenciateurs techniques rapides à utiliser, lents à copier |
 | Churn élevé suite à un mois sans opportunités | Modérée | Modéré | Garantie 30j basée sur qualité des signaux, contenu éducatif pour fidéliser |
 | Marché CS2 s'effondre (Valve abandonne) | Très faible | Critique | Architecture extensible vers Rust, Dota 2, TF2 en V3 |
+| CSFloat rate limit saturé (100 req/h) | Modérée (V1+) | Modéré | Ne récupérer le float que sur les items non encore trackés (cache assetid → float). En V2 : parser directement le lien inspect sans API tierce. |
+| Inventaire Steam privé (sync impossible) | Modérée | Modéré | Détecter dès l'OAuth Steam si l'inventaire est public. Afficher une instruction "Rends ton inventaire public pour activer la sync automatique". Fallback : déclaration manuelle toujours disponible. |
+| WebSocket Skinport multi-tenant | Faible (scaling) | Modéré | Une seule connexion WebSocket Skinport partagée côté serveur, fan-out en interne vers tous les paniers actifs de tous les utilisateurs. Pas de connexion WebSocket par utilisateur. |
 
 ---
 
 ## Résumé exécutif technique v2.0
 
-La version 2.0 intègre les données de marché réelles collectées en mars 2026. La principale évolution par rapport à la v1.0 est l'**élimination de Pricempire API du MVP** (trop cher : 119.90$/mois / 10 000 appels) et son remplacement par une architecture 100% gratuite basée sur **ByMykel CSGO-API + Skinport API**.
+La version 2.0 (mars 2026) est une spécification complète couvrant l'ensemble du cycle de vie d'un trade-up CS2 : détection d'opportunités, sélection des meilleurs listings, gestion du portefeuille multi-paniers, exécution automatisée et tracking P&L.
 
-Cette architecture est techniquement supérieure pour le MVP :
-- Les données ByMykel fournissent exactement la structure de pool d'outputs nécessaire
-- L'endpoint `/v1/sales/history` de Skinport fournit le score de liquidité — le différenciateur clé de Kontract.gg — sans aucun coût
-- La seule contrainte technique nouvelle est la décompression Brotli obligatoire pour les endpoints Skinport (`httpx[brotli]` — 1 ligne d'installation)
+**Architecture clé :**
+- 100% gratuit pour le MVP : ByMykel CSGO-API + Skinport API + Steam API
+- WebSocket Skinport en temps réel pour les alertes d'achat (< 500ms)
+- Kontract Score v3 (Sharpe ratio — suppression du double-comptage win_prob × EV)
+- 8 hard filters + score hybride 4 dimensions pour chaque listing
+- PanierState avec sync inventaire Steam et calcul dynamique du float marginal requis
+- OutputDetector : détection automatique de l'output via comparaison d'inventaire
+- P&L Tracker avec vérification de la précision de la formule de float
 
-| Coût données MVP | Délai MVP | Lignes de code | Rate limit Skinport |
-|-----------------|-----------|----------------|---------------------|
-| **0 €** | 3 semaines | ~1 500 | 8 req/5min |
+| Coût données MVP | Délai MVP | Modules | Rate limit Skinport | Dépendances critiques |
+|-----------------|-----------|---------|---------------------|-----------------------|
+| **0€** | 3 semaines | 11 | 8 req/5min | httpx[brotli], python-socketio, msgpack |
 
 ---
 
