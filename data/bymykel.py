@@ -4,6 +4,7 @@ Télécharge les données de structure CS2 depuis ByMykel CSGO-API et peuple la 
 Source : https://github.com/ByMykel/CSGO-API
 """
 
+import asyncio
 import logging
 import httpx
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -38,13 +39,14 @@ def get_output_pool(collection: dict, input_rarity_id: str) -> list:
     return [s for s in collection["contains"] if s["rarity"]["id"] == next_tier]
 
 
-def _fetch_json(url: str) -> list | dict:
-    resp = httpx.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+async def _fetch_json(url: str) -> list | dict:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
 
 
-def build_collections_db() -> dict:
+async def build_collections_db() -> dict:
     """
     Télécharge collections.json + skins.json depuis ByMykel,
     peuple les tables collections, skins et tradeup_pool.
@@ -53,10 +55,10 @@ def build_collections_db() -> dict:
     init_db()
 
     logger.info("Téléchargement collections.json...")
-    collections = _fetch_json(f"{BASE_URL}/collections.json")
+    collections = await _fetch_json(f"{BASE_URL}/collections.json")
 
     logger.info("Téléchargement skins.json...")
-    skins_list = _fetch_json(f"{BASE_URL}/skins.json")
+    skins_list = await _fetch_json(f"{BASE_URL}/skins.json")
 
     # Index des skins détaillés par id
     skins_idx: dict[str, dict] = {s["id"]: s for s in skins_list}
@@ -138,7 +140,7 @@ def build_collections_db() -> dict:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    result = build_collections_db()
+    result = asyncio.run(build_collections_db())
     print(f"\nRésultat : {result}")
 
     # Vérification rapide sur 5 collections

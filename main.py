@@ -98,7 +98,7 @@ async def job_update_bymykel() -> None:
     """Job hebdomadaire : mise à jour BDD depuis ByMykel."""
     logger.info("=== MAJ ByMykel démarrée ===")
     try:
-        stats = build_collections_db()
+        stats = await build_collections_db()
         logger.info("ByMykel: %s", stats)
     except Exception as exc:
         logger.error("Erreur ByMykel: %s", exc)
