@@ -44,11 +44,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # Filtres par défaut du cycle de scan
 DEFAULT_FILTERS = UserFilters(
-    min_roi=0.0,        # Permettre de voir toutes les opportunités neutres/positives
+    min_roi=0.0,             # Permettre de voir toutes les opportunités neutres/positives
     max_budget=400.0,
-    max_pool_size=15,   # Elargir pour inclure des collections plus grandes
+    max_pool_size=15,        # Elargir pour inclure des collections plus grandes
     min_volume_sell_price=10.0,  # Match avec les réglages UI recommandés
-    min_liquidity=1.0,  # Conforme spec §4.5
+    min_liquidity=1.0,       # Conforme spec §4.5
+    min_volume_input=0.0,    # Pas de filtre volume input côté backend — laisser le scanner décider
 )
 
 

@@ -32,7 +32,7 @@ class UserFilters:
     exclude_trending_down: bool = False    # exclure outputs en baisse > 15% sur 30 jours
     exclude_high_volatility: bool = False  # exclure outputs avec variation 24h > 15%
     min_kontract_score: float = 0.0        # filtre composite Kontract Score
-    min_volume_input: float = 1.0          # liquidité minimum de l'input (ventes/j)
+    min_volume_input: float = 0.1          # liquidité minimum de l'input (ventes/j) — 0.1 = au moins 1 vente tous les 10j
     min_quantity_input: int = 10           # quantité minimum disponible pour exécution
     source_buy: str = "skinport"
     source_sell: str = "skinport"
@@ -524,9 +524,16 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
         "Scan terminé : %d combos évalués, %d opportunités qualifiées (ROI ≥ %.0f%%)",
         checked, len(opportunities), filters.min_roi,
     )
+    total_inputs = len(eligible_inputs)
+    f_vol_input = sum(
+        1 for skin in eligible_inputs
+        if (buy_prices.get(skin.id, {}).get("volume_24h") or 0.0) < filters.min_volume_input
+    )
     logger.info(
-        "Filtres : pas_pool=%d budget=%d pool_size=%d no_output=%d ev_err=%d roi=%d liquidity=%d | PASS=%d",
-        f_no_pool, f_budget, f_pool_size, f_no_output, f_ev_err, f_roi, f_liquidity, len(opportunities)
+        "Rejetés : pas_pool=%d vol_input<%.1f=%d budget=%d pool_size=%d no_output=%d ev_err=%d roi=%d liquidity=%d | PASS=%d / %d inputs",
+        f_no_pool, filters.min_volume_input, f_vol_input,
+        f_budget, f_pool_size, f_no_output, f_ev_err, f_roi, f_liquidity,
+        len(opportunities), total_inputs,
     )
     return opportunities
 
