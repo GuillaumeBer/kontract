@@ -27,7 +27,7 @@ class UserFilters:
     min_roi: float = 10.0
     max_budget: float = 200.0              # spec §4.3 : défaut 200 €
     max_pool_size: int = 5
-    min_liquidity: float = 1.0              # spec §4.5 : défaut 1.0
+    min_liquidity: float = 0.0              # spec §4.5 : 0 = pas de filtre par défaut (liquidité visible dans la colonne)
     min_volume_sell_price: int = 10         # ventes min pour fiabilité statistique (plage 10–100)
     exclude_trending_down: bool = False    # exclure outputs en baisse > 15% sur 30 jours
     exclude_high_volatility: bool = False  # exclure outputs avec variation 24h > 15%
@@ -205,6 +205,7 @@ def _build_outputs_by_collection(
                 volume_24h=sp_data.get("volume_24h", 0.0),
                 volume_7d=sp_data.get("volume_7d", 0.0),
                 volume_30d=sp_data.get("volume_30d", 0.0),
+                quantity=sp_data.get("quantity") or 0,
                 median_24h=sp_data.get("median_24h"),
                 median_7d=sp_data.get("median_7d"),
                 median_30d=sp_data.get("median_30d"),

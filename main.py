@@ -48,7 +48,7 @@ DEFAULT_FILTERS = UserFilters(
     max_budget=400.0,
     max_pool_size=15,        # Elargir pour inclure des collections plus grandes
     min_volume_sell_price=10.0,  # Match avec les réglages UI recommandés
-    min_liquidity=1.0,       # Conforme spec §4.5
+    min_liquidity=0.0,       # 0 = inclure toutes les opps même sans historique de ventes
     min_volume_input=0.0,    # Pas de filtre volume input côté backend — laisser le scanner décider
 )
 
