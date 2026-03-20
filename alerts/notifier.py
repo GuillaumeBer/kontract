@@ -39,8 +39,18 @@ def _format_opportunity_message(opp: dict) -> str:
     # Scalability
     max_repeats = opp.get("max_repeats", 0) or 0
 
+    # Kelly Criterion
+    kelly = opp.get("kelly_criterion", 0.0) or 0.0
+    kelly_text = f" | *Kelly* : {kelly:.1f}%" if kelly > 0 else ""
+
+    # Momentum & Pump badges
+    momentum_score = opp.get("momentum_score", 0.5)
+    momentum_badge = "📈📈 " if momentum_score >= 0.7 else ""
+    pump_score = opp.get("pump_score", 0.0) or 0.0
+    pump_badge = "⚠️ PUMP " if pump_score > 0.5 else ""
+
     return (
-        f"{velocity_badge}🎯 *Trade-up Profitable Détecté !*\n\n"
+        f"{pump_badge}{momentum_badge}{velocity_badge}🎯 *Trade-up Profitable Détecté !*\n\n"
         f"*Input* : {opp['input_name']}\n"
         f"*Kontract Score* : {ks:.2f} — {ks_label}\n"
         f"*ROI* : {opp['roi']:.1f}%\n"
@@ -48,7 +58,7 @@ def _format_opportunity_message(opp: dict) -> str:
         f"*EV nette* : {opp['ev_nette']:.2f}€\n"
         f"*Coût 10x* : {opp['cout_ajuste']:.2f}€\n"
         f"*Pool size* : {opp['pool_size']} outcomes\n"
-        f"*Win prob* : {opp['win_prob']:.1f}%\n"
+        f"*Win prob* : {opp['win_prob']:.1f}%{kelly_text}\n"
         f"*Floor* : {floor_pct}% | *Inputs* : {liq_emoji} {liq_status}"
         f" | *Répétable* : {max_repeats}×\n\n"
         f"*Outputs possibles* :\n{outputs_text}"

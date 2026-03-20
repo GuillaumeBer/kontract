@@ -81,35 +81,76 @@ async def build_collections_db() -> dict:
 
             for skin_ref in collection.get("contains", []):
                 full = skins_idx.get(skin_ref["id"], {})
-
-                # Construire market_hash_name depuis le skin détaillé
-                market_hash_name = full.get("market_hash_name") or full.get("name")
+                can_be_st = full.get("stattrak", False)
+                
+                # Suffixes et préfixes officiels pour matching Skinport (§4.3)
+                base_id = skin_ref["id"]
+                base_name = skin_ref.get("name", "")
+                
+                # --- 1. Version NORMALE ---
+                # On force stattrak=False pour l'entrée de base
+                # market_hash_name standard : "Weapon | Skin"
+                normal_hash = full.get("market_hash_name") or full.get("name") or base_name
+                if normal_hash.startswith("StatTrak™ "):
+                    normal_hash = normal_hash.replace("StatTrak™ ", "")
 
                 session.merge(Skin(
-                    id=skin_ref["id"],
-                    name=skin_ref.get("name", ""),
+                    id=base_id,
+                    name=base_name,
                     weapon=full.get("weapon", {}).get("name") if full.get("weapon") else None,
                     collection_id=collection["id"],
                     rarity_id=skin_ref["rarity"]["id"],
                     rarity_name=skin_ref["rarity"].get("name"),
                     float_min=full.get("min_float"),
                     float_max=full.get("max_float"),
-                    stattrak=full.get("stattrak", False),
-                    market_hash_name=market_hash_name,
+                    stattrak=False,
+                    market_hash_name=normal_hash,
                 ))
                 stats["skins"] += 1
 
-                # Construction du pool d'outputs
+                # --- 2. Version STATTRAK (optionnelle) ---
+                if can_be_st:
+                    st_id = f"{base_id}_st"
+                    st_hash = f"StatTrak™ {normal_hash}"
+                    
+                    session.merge(Skin(
+                        id=st_id,
+                        name=f"{base_name} (StatTrak™)",
+                        weapon=full.get("weapon", {}).get("name") if full.get("weapon") else None,
+                        collection_id=collection["id"],
+                        rarity_id=skin_ref["rarity"]["id"],
+                        rarity_name=skin_ref["rarity"].get("name"),
+                        float_min=full.get("min_float"),
+                        float_max=full.get("max_float"),
+                        stattrak=True,
+                        market_hash_name=st_hash,
+                    ))
+                    stats["skins"] += 1
+
+                # Construction du pool d'outputs (pour les deux versions)
                 outputs = get_output_pool(collection, skin_ref["rarity"]["id"])
                 for output in outputs:
-                    valid_triplets.add((skin_ref["id"], output["id"], collection["id"]))
-                    # Upsert via INSERT OR IGNORE (SQLite)
-                    stmt = sqlite_insert(TradeupPool).values(
-                        input_skin_id=skin_ref["id"],
+                    # Lien Normal -> Normal
+                    valid_triplets.add((base_id, output["id"], collection["id"]))
+                    stmt_norm = sqlite_insert(TradeupPool).values(
+                        input_skin_id=base_id,
                         output_skin_id=output["id"],
                         collection_id=collection["id"],
                     ).on_conflict_do_nothing()
-                    session.execute(stmt)
+                    session.execute(stmt_norm)
+                    
+                    # Lien StatTrak -> StatTrak
+                    if can_be_st:
+                        # On assume que l'output peut aussi être ST (quasi toujours vrai en CS2)
+                        st_out_id = f"{output['id']}_st"
+                        valid_triplets.add((st_id, st_out_id, collection["id"]))
+                        stmt_st = sqlite_insert(TradeupPool).values(
+                            input_skin_id=st_id,
+                            output_skin_id=st_out_id,
+                            collection_id=collection["id"],
+                        ).on_conflict_do_nothing()
+                        session.execute(stmt_st)
+                        
                     stats["tradeup_links"] += 1
 
         # Supprimer les liens TradeupPool obsolètes (absents des données ByMykel actuelles)

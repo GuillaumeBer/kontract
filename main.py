@@ -14,6 +14,8 @@ Usage :
 import asyncio
 import logging
 import os
+import json
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -25,6 +27,10 @@ from data.database import init_db
 from engine.scanner import UserFilters, save_opportunities, scan_all_opportunities
 from fetcher.skinport import update_prices_from_skinport
 from fetcher.steam import update_prices_from_steam
+from engine.recommender import ActionRecommender
+from engine.output_detector import OutputDetector
+from engine.sell_engine import OutputSellEngine
+from engine.momentum import PriceSignalEngine
 
 load_dotenv()
 logging.basicConfig(
@@ -38,10 +44,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # Filtres par défaut du cycle de scan
 DEFAULT_FILTERS = UserFilters(
-    min_roi=10.0,
-    max_budget=200.0,
-    max_pool_size=5,
-    min_liquidity=0.0,  # 0 jusqu'à ce que les volumes soient correctement chargés
+    min_roi=0.0,        # Permettre de voir toutes les opportunités neutres/positives
+    max_budget=400.0,
+    max_pool_size=15,   # Elargir pour inclure des collections plus grandes
+    min_volume_sell_price=10.0,  # Match avec les réglages UI recommandés
+    min_liquidity=1.0,  # Conforme spec §4.5
 )
 
 
@@ -50,6 +57,14 @@ async def job_fetch_and_scan() -> None:
     logger.info("=== Cycle fetch+scan démarré ===")
 
     try:
+        from data.database import redis_client
+        if redis_client:
+            redis_client.set("scan:last_start", datetime.now().isoformat())
+        else:
+            # Fallback fichier si Redis est absent
+            with open("scan_status.json", "w") as f:
+                json.dump({"last_start": datetime.now().isoformat()}, f)
+            
         stats = await update_prices_from_skinport()
         logger.info("Skinport: %s", stats)
     except Exception as exc:
@@ -72,6 +87,36 @@ async def job_fetch_and_scan() -> None:
             logger.error("Erreur Telegram: %s", exc)
 
     logger.info("=== Cycle terminé ===")
+
+
+async def job_action_plan() -> None:
+    """Job toutes les 5 min : génère le plan d'action centralisé."""
+    logger.info("=== Génération du Plan d'Action ===")
+    from data.database import get_session
+    from data.models import TradeupBasket, Opportunity
+    
+    with get_session() as session:
+        baskets = session.query(TradeupBasket).filter_by(status="active").all()
+        # Mocking opportunities for now - in real it would come from recent scans
+        opps_raw = session.query(Opportunity).order_by(Opportunity.kontract_score.desc()).limit(10).all()
+        opps = [
+            {"input_name": o.combo_hash.split(":")[0], "roi": o.roi, "kontract_score": o.kontract_score, "cout_ajuste": o.cout_ajuste}
+            for o in opps_raw
+        ]
+
+    recommender = ActionRecommender()
+    # Simple mock check for free slots (Spec §4.8)
+    free_slots = 5 - len(baskets)
+    
+    actions = recommender.generate_action_plan(opps, baskets, [])
+    
+    if actions:
+        logger.info("Plan d'Action : %d recommandations générées.", len(actions))
+        # Top action info
+        top = actions[0]
+        logger.info("Top Action : [%s] %s - %s", top.type.value, top.opportunity_name, top.reason)
+    
+    logger.info("=== Plan d'Action terminé ===")
 
 
 async def job_fetch_steam() -> None:
@@ -134,6 +179,9 @@ async def main() -> None:
 
     # Job principal toutes les 5 min
     scheduler.add_job(job_fetch_and_scan, "interval", minutes=5, id="fetch_scan")
+
+    # Génération du plan d'action toutes les 5 min (décalé de 30s)
+    scheduler.add_job(job_action_plan, "interval", minutes=5, id="action_plan", start_date=datetime.now() + timedelta(seconds=30))
 
     # Fetch Steam prices toutes les 10 min (cross-check §2.3, spec §3.2)
     scheduler.add_job(job_fetch_steam, "interval", minutes=10, id="steam_fetch")

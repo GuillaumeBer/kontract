@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from data.database import get_session
-from data.models import Opportunity, Price, Skin, TradeupPool
+from data.models import Opportunity, Price, Skin, TradeupPool, Collection
 from engine.ev_calculator import InputSkin, OutputSkin, calculate_ev
 
 logger = logging.getLogger(__name__)
@@ -27,8 +27,8 @@ class UserFilters:
     min_roi: float = 10.0
     max_budget: float = 200.0              # spec §4.3 : défaut 200 €
     max_pool_size: int = 5
-    min_liquidity: float = 3.0
-    min_volume_sell_price: int = 30        # ventes min pour fiabilité statistique (plage 10–100)
+    min_liquidity: float = 1.0              # spec §4.5 : défaut 1.0
+    min_volume_sell_price: int = 10         # ventes min pour fiabilité statistique (plage 10–100)
     exclude_trending_down: bool = False    # exclure outputs en baisse > 15% sur 30 jours
     exclude_high_volatility: bool = False  # exclure outputs avec variation 24h > 15%
     min_kontract_score: float = 0.0        # filtre composite Kontract Score
@@ -227,6 +227,7 @@ def _try_evaluate(
     input_trend: float,
     input_liquidity: str,
     input_vol_24h: float,
+    collection_active: bool = True,
 ) -> "EVResult | None":
     """Try to evaluate a trade-up, return EVResult or None if error/filtered."""
     try:
@@ -237,9 +238,11 @@ def _try_evaluate(
             source_sell=filters.source_sell,
             min_vol_7d=filters.min_volume_sell_price,
             exclude_trending_down=filters.exclude_trending_down,
+            exclude_high_volatility=filters.exclude_high_volatility,
             input_trend=input_trend,
             input_liquidity_status=input_liquidity,
             vol_24h_input=input_vol_24h,
+            collection_active=collection_active,
         )
     except ValueError:
         return None
@@ -275,6 +278,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
         skin_names: dict[str, str] = {s.id: s.name for s in session.query(Skin).all()}
         skin_rarities: dict[str, str] = {s.id: s.rarity_id for s in session.query(Skin).all()}
         skin_colls: dict[str, str] = {s.id: s.collection_id for s in session.query(Skin).all()}
+        coll_active: dict[str, bool] = {c.id: c.active for c in session.query(Collection).all()}
 
         # Build filler index for strategy B (spec §4.4)
         filler_index = _build_filler_index(eligible_inputs, buy_prices, pool_idx)
@@ -316,8 +320,8 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
             if input_vol_24h < filters.min_volume_input:
                 continue
 
-            # Filtre quantité minimum (exécutabilité)
-            if quantity is not None and quantity < filters.min_quantity_input:
+            # Filtre quantité minimum (exécutabilité) — exclure les items en rupture
+            if quantity is not None and quantity < 1:
                 continue
 
             # Règle Covert post-oct 2025 : rarity_ancient_weapon → 5 inputs (spec §4.4)
@@ -361,6 +365,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                 result_pure = _try_evaluate(
                     pure_inputs, outputs_by_coll, filters,
                     input_trend, input_liquidity, input_vol_24h,
+                    collection_active=coll_active.get(coll_id, True)
                 )
                 if result_pure:
                     checked += 1
@@ -421,6 +426,7 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                             result_filler = _try_evaluate(
                                 mixed_inputs, mixed_outputs_by_coll, filters,
                                 input_trend, input_liquidity, input_vol_24h,
+                                collection_active=coll_active.get(coll_id, True)
                             )
                             if result_filler:
                                 checked += 1
@@ -495,6 +501,10 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
                     "kontract_score": result.kontract_score,
                     "price_reliability": result.price_reliability,
                     "high_volatility": result.high_volatility,
+                    "pump_score": result.pump_score,
+                    "momentum_score": result.momentum_score,
+                    "momentum_multiplier": result.momentum_multiplier,
+                    "kelly_criterion": result.kelly_criterion,
                     "strategy_used": strategy_used,
                     "input_liquidity_status": input_liquidity,
                     "velocity_alert": velocity_alert,
@@ -522,12 +532,24 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
 
 
 def save_opportunities(opportunities: list[dict]) -> int:
-    """Persiste les opportunités qualifiées en BDD. Retourne le nombre sauvegardé."""
-    if not opportunities:
-        return 0
+    """Persiste les opportunités qualifiées en BDD. Retourne le nombre sauvegardé.
+    Supprime les opportunités obsolètes qui ne sont plus détectées."""
 
     saved = 0
     with get_session() as session:
+        if not opportunities:
+            return 0
+
+        # Nettoyage : supprimer les opportunités qui ne sont plus dans le scan actuel
+        # (uniquement quand le scan a trouvé des résultats — évite de vider la DB en cas de rate limit ou 0 opps)
+        current_hashes = {opp["combo_hash"] for opp in opportunities}
+        stale = session.query(Opportunity).filter(~Opportunity.combo_hash.in_(current_hashes)).all()
+        for s in stale:
+            session.delete(s)
+        if stale:
+            session.commit()
+            logger.info("Nettoyage: %d opportunités obsolètes supprimées", len(stale))
+
         for opp in opportunities:
             existing = (
                 session.query(Opportunity)
@@ -549,6 +571,10 @@ def save_opportunities(opportunities: list[dict]) -> int:
                 existing.strategy_used = opp["strategy_used"]
                 existing.cout_ajuste = opp["cout_ajuste"]
                 existing.high_volatility = opp["high_volatility"]
+                existing.pump_score = opp.get("pump_score", 0.0)
+                existing.momentum_score = opp.get("momentum_score", 0.5)
+                existing.momentum_multiplier = opp.get("momentum_multiplier", 1.0)
+                existing.kelly_criterion = opp.get("kelly_criterion", 0.0)
             else:
                 n_inputs_save = 5 if opp.get("input_rarity_id") == "rarity_ancient_weapon" else 10
                 session.add(Opportunity(
@@ -567,6 +593,10 @@ def save_opportunities(opportunities: list[dict]) -> int:
                     strategy_used=opp["strategy_used"],
                     cout_ajuste=opp["cout_ajuste"],
                     high_volatility=opp["high_volatility"],
+                    pump_score=opp.get("pump_score", 0.0),
+                    momentum_score=opp.get("momentum_score", 0.5),
+                    momentum_multiplier=opp.get("momentum_multiplier", 1.0),
+                    kelly_criterion=opp.get("kelly_criterion", 0.0),
                 ))
                 saved += 1
         session.commit()

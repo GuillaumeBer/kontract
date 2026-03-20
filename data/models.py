@@ -58,6 +58,8 @@ class Price(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     skin_id = Column(String, ForeignKey("skins.id"), nullable=False)
     platform = Column(String, nullable=False)  # "skinport" | "steam"
+    market_hash_name = Column(String, nullable=True) # Nom exact matché (ex: Vulcan (Field-Tested))
+    item_page = Column(String, nullable=True) # URL directe Skinport (ex: https://skinport.com/item/csgo/...)
     buy_price = Column(Float, nullable=True)
     sell_price = Column(Float, nullable=True)
     volume_24h = Column(Float, nullable=True)
@@ -118,4 +120,56 @@ class Opportunity(Base):
     strategy_used = Column(String, nullable=True)           # "pure" | "fillers"
     cout_ajuste = Column(Float, nullable=True)
     high_volatility = Column(Boolean, nullable=True)
+    pump_score = Column(Float, nullable=True)
+    momentum_score = Column(Float, nullable=True)
+    momentum_multiplier = Column(Float, nullable=True)
+    kelly_criterion = Column(Float, nullable=True)
+
+
+class TradeupBasket(Base):
+    __tablename__ = "tradeup_baskets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, nullable=False)  # chat_id
+    input_skin_id = Column(String, ForeignKey("skins.id"), nullable=False)
+    collection_id = Column(String, ForeignKey("collections.id"), nullable=False)
+    target_roi = Column(Float, nullable=True)
+    target_condition = Column(String, nullable=True)
+    status = Column(String, default="active")  # "active" | "completed" | "cancelled"
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    items = relationship("BasketItem", back_populates="basket")
+
+
+class BasketItem(Base):
+    __tablename__ = "basket_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    basket_id = Column(Integer, ForeignKey("tradeup_baskets.id"), nullable=False)
+    skin_id = Column(String, ForeignKey("skins.id"), nullable=False)
+    buy_price = Column(Float, nullable=False)
+    float_value = Column(Float, nullable=True)
+    date_bought = Column(DateTime, default=datetime.utcnow)
+
+    basket = relationship("TradeupBasket", back_populates="items")
+
+
+class PandL(Base):
+    """
+    Historical P&L and Accuracy tracking (Spec §4.10)
+    """
+    __tablename__ = "p_and_l"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    basket_id = Column(Integer, ForeignKey("tradeup_baskets.id"), nullable=False)
+    output_skin_id = Column(String, ForeignKey("skins.id"), nullable=False)
+    total_cost = Column(Float, nullable=False)
+    sell_price_net = Column(Float, nullable=False)  # Price after fees
+    ev_predicted = Column(Float, nullable=False)
+    p_and_l_euro = Column(Float, nullable=False)
+    p_and_l_percent = Column(Float, nullable=False)
+    ev_error_percent = Column(Float, nullable=False)
+    float_predicted = Column(Float, nullable=True)
+    float_actual = Column(Float, nullable=True)
+    status = Column(String, default="completed")  # "completed" | "hold"
     created_at = Column(DateTime, default=datetime.utcnow)

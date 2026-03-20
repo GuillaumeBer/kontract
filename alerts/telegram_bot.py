@@ -24,8 +24,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from data.database import get_session, init_db
-from data.models import UserAlert
+from data.models import UserAlert, TradeupBasket
 from engine.scanner import UserFilters, scan_all_opportunities
+from basket.panier_state import PanierState
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -227,6 +228,95 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_markdown(header + "\n\n".join(lines))
 
 
+async def cmd_panier(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Affiche l'état des paniers actifs (§6.2)."""
+    chat_id = str(update.effective_chat.id)
+    with get_session() as session:
+        baskets = session.query(TradeupBasket).filter_by(user_id=chat_id, status="active").all()
+        
+    if not baskets:
+        await update.message.reply_text("🛒 Aucun panier actif. Commencez un trade-up sur le Dashboard !")
+        return
+        
+    msg = "🛒 *Vos paniers en cours :*\n\n"
+    for b in baskets:
+        ps = PanierState(b)
+        m = ps.get_current_metrics()
+        msg += f"📦 *Panier #{b.id}* — {b.input_skin_id}\n"
+        msg += f"  Progression : {ps.n_bought}/{ps.n_total} items\n"
+        msg += f"  Coût : {m['total_cost']:.2f}€ | Float : {m['avg_float']:.4f}\n"
+        msg += f"  _Exécuter : /executed {b.id} | Abandonner : /abandon {b.id}_\n\n"
+        
+    await update.message.reply_markdown(msg)
+
+
+async def cmd_abandon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Marque un panier comme abandonné : /abandon <id>."""
+    chat_id = str(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("❌ Usage : /abandon <basket_id>")
+        return
+
+    try:
+        basket_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID invalide.")
+        return
+
+    with get_session() as session:
+        basket = session.query(TradeupBasket).filter_by(id=basket_id, user_id=chat_id).first()
+        if not basket:
+            await update.message.reply_text("❌ Panier introuvable.")
+            return
+        basket.status = "abandoned"
+        session.commit()
+    
+    await update.message.reply_text(f"🛑 Panier #{basket_id} abandonné.")
+
+
+async def cmd_executed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Marque un panier comme exécuté : /executed <id>."""
+    chat_id = str(update.effective_chat.id)
+    if not context.args:
+        await update.message.reply_text("❌ Usage : /executed <basket_id>")
+        return
+
+    try:
+        basket_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID invalide.")
+        return
+
+    with get_session() as session:
+        basket = session.query(TradeupBasket).filter_by(id=basket_id, user_id=chat_id).first()
+        if not basket:
+            await update.message.reply_text("❌ Panier introuvable.")
+            return
+        
+        basket.status = "completed"
+        session.commit()
+        
+    await update.message.reply_text(f"✅ Panier #{basket_id} marqué comme exécuté ! L'OutputDetector va analyser votre inventaire.")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Affiche l'aide des commandes."""
+    msg = (
+        "🤖 *Commandes Kontract.gg*\n\n"
+        "🔍 *Scan & Profil*\n"
+        "/scan — Scan immédiat (top 5)\n"
+        "/profil — Voir vos filtres\n"
+        "/config — Modifier vos filtres\n"
+        "/pause | /resume — Gérer les alertes\n\n"
+        "🛒 *Gestion Portfolio*\n"
+        "/panier — Vos paniers actifs\n"
+        "/executed <id> — Exécuter un panier\n"
+        "/abandon <id> — Abandonner un panier\n\n"
+        "_Exemple config : /config roi=15 budget=200_"
+    )
+    await update.message.reply_markdown(msg)
+
+
 async def send_notifications(notifications: list[tuple[str, str]], token: str) -> None:
     """Envoie les messages Telegram pour les opportunités matchées."""
     if not notifications or not token:
@@ -254,6 +344,10 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("panier", cmd_panier))
+    app.add_handler(CommandHandler("executed", cmd_executed))
+    app.add_handler(CommandHandler("abandon", cmd_abandon))
+    app.add_handler(CommandHandler("help", cmd_help))
     return app
 
 

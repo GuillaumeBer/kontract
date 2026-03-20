@@ -3,7 +3,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 
-from data.models import Base
+from data.models import Base, Collection, Skin, Price, UserAlert, Opportunity, TradeupBasket, BasketItem, PandL
 
 load_dotenv()
 

@@ -9,6 +9,8 @@ IMPORTANT : le header Accept-Encoding: br est OBLIGATOIRE pour les deux endpoint
 """
 
 import logging
+import json
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -16,6 +18,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from data.database import get_session, redis_client
 from data.models import Price, Skin
+from data.throttler import Throttler
 
 logger = logging.getLogger(__name__)
 
@@ -28,15 +31,40 @@ async def fetch_items(currency: str = "EUR") -> list[dict]:
     Récupère prix min/max/moyen/médian + quantité disponible pour tous les skins.
     Retourne une liste de dicts bruts Skinport.
     """
+    if Throttler.is_rate_limited("skinport"):
+        logger.warning("Skinport: skipping items fetch due to active rate limit.")
+        return []
+
+    if redis_client:
+        cached = redis_client.get("skinport:items")
+        if cached:
+            logger.info("Using cached Skinport items")
+            return json.loads(cached)
+
+    # Persist un gap de 40s min (§3.5)
+    Throttler.wait_for_service("skinport:items", 40)
+
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{BASE_URL}/items",
-            params={"app_id": 730, "currency": currency, "tradable": 0},
-            headers=BROTLI_HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = await client.get(
+                f"{BASE_URL}/items",
+                params={"app_id": 730, "currency": currency, "tradable": 0},
+                headers=BROTLI_HEADERS,
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                Throttler.mark_rate_limited("skinport")
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if redis_client and data:
+                redis_client.setex("skinport:items", 240, json.dumps(data))
+            
+            return data
+        except Exception as e:
+            logger.error(f"Skinport items fetch error: {e}")
+            return []
 
 
 async def fetch_sales_history(currency: str = "EUR") -> list[dict]:
@@ -44,15 +72,40 @@ async def fetch_sales_history(currency: str = "EUR") -> list[dict]:
     Récupère les volumes de ventes sur 24h / 7j / 30j / 90j.
     Utilisé pour le score de liquidité.
     """
+    if Throttler.is_rate_limited("skinport"):
+        logger.warning("Skinport: skipping history fetch due to active rate limit.")
+        return []
+
+    if redis_client:
+        cached = redis_client.get("skinport:history")
+        if cached:
+            logger.info("Using cached Skinport history")
+            return json.loads(cached)
+
+    # Persist un gap de 40s min (§3.5)
+    Throttler.wait_for_service("skinport:history", 40)
+
     async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{BASE_URL}/sales/history",
-            params={"app_id": 730, "currency": currency},
-            headers=BROTLI_HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = await client.get(
+                f"{BASE_URL}/sales/history",
+                params={"app_id": 730, "currency": currency},
+                headers=BROTLI_HEADERS,
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                Throttler.mark_rate_limited("skinport")
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+
+            if redis_client and data:
+                redis_client.setex("skinport:history", 240, json.dumps(data))
+
+            return data
+        except Exception as e:
+            logger.error(f"Skinport history fetch error: {e}")
+            return []
 
 
 WEAR_CONDITIONS = [
@@ -147,8 +200,8 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
             ).first()
 
             if existing and existing.sell_price and new_sell:
-                # Force update if historical columns are still NULL (new columns migration)
-                if existing.median_7d is None or existing.median_90d is None:
+                # Force update if columns are still NULL (new columns migration)
+                if existing.median_7d is None or existing.median_90d is None or existing.market_hash_name is None or existing.item_page is None:
                     pass 
                 else:
                     variation = abs(new_sell - existing.sell_price) / existing.sell_price
@@ -159,6 +212,8 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
             stmt = sqlite_insert(Price).values(
                 skin_id=skin.id,
                 platform="skinport",
+                market_hash_name=sp_item.get("market_hash_name"),
+                item_page=sp_item.get("item_page"),
                 buy_price=new_buy,
                 sell_price=new_sell,
                 volume_24h=volume_24h,
@@ -177,6 +232,8 @@ async def update_prices_from_skinport(threshold: float = 0.005) -> dict:
             ).on_conflict_do_update(
                 index_elements=["skin_id", "platform"],
                 set_=dict(
+                    market_hash_name=sp_item.get("market_hash_name"),
+                    item_page=sp_item.get("item_page"),
                     buy_price=new_buy,
                     sell_price=new_sell,
                     volume_24h=volume_24h,

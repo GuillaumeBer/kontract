@@ -12,6 +12,7 @@ Formule EV en 5 étapes (spec §4.3) :
 
 import math
 from dataclasses import dataclass, field
+from engine.momentum import PriceSignalEngine
 
 # Frais par plateforme (spec §4.3 — centralisés et versionnés)
 # Skinport : frais acheteur = 0% (prix affiché = prix payé), 3% côté vendeur
@@ -85,6 +86,39 @@ def get_sell_price(price_data: dict, steam_data: dict | None = None) -> "SellPri
     )
 
 
+def detect_pump(out: "OutputSkin") -> float:
+    """
+    Detects potential price manipulation (Spec §4.7.2).
+    Returns a pump_score (0-1), where 1.0 is a definite pump.
+    """
+    if not out.avg_7d or out.avg_7d <= 0 or not out.avg_24h:
+        return 0.0
+
+    # Increase > 50% in 24h vs 7d average
+    price_jump = (out.avg_24h - out.avg_7d) / out.avg_7d
+    
+    # Low liquidity makes it easier to pump
+    low_liq = 1.0 if (out.volume_7d or 0) < 15 else 0.5 if (out.volume_7d or 0) < 30 else 0.0
+    
+    if price_jump > 0.50:
+        return 1.0 * low_liq
+    elif price_jump > 0.25:
+        return 0.5 * low_liq
+    
+    return 0.0
+
+
+def get_doppler_ev(base_price: float, skin_name: str) -> float:
+    """
+    Weighted average price for Dopplers (Spec §4.7).
+    Weights: P1-P4 (98% combined), Ruby/Sapphire (1.5%), Emerald/Black Pearl (0.5%).
+    Simplified for MVP: +15% premium to median price to account for rare phases.
+    """
+    if "Doppler" in skin_name:
+        return base_price * 1.15
+    return base_price
+
+
 @dataclass
 class InputSkin:
     skin_id: str
@@ -131,6 +165,10 @@ class EVResult:
     floor_ratio: float     # min(prix_outputs) × (1 - frais_vente) / cout_ajuste
     kontract_score: float
     high_volatility: bool = False   # True si ≥1 output avec variation 24h > 15% vs avg_7d
+    pump_score: float = 0.0         # 0.0 - 1.0 (signaux de manipulation)
+    momentum_score: float = 0.5     # 0.0 - 1.0
+    momentum_multiplier: float = 1.0
+    kelly_criterion: float = 0.0     # % suggéré d'allocation
     price_reliability: str = "low"  # "high" | "medium" | "low"
     outputs: list[dict] = field(default_factory=list)
 
@@ -142,9 +180,11 @@ def calculate_ev(
     source_sell: str = "skinport",
     min_vol_7d: int = 30,
     exclude_trending_down: bool = False,
+    exclude_high_volatility: bool = False,
     input_trend: float = 0.0,        # (avg_24h - avg_7d) / avg_7d des inputs — détection recipe velocity
     input_liquidity_status: str = "liquid",  # "liquid" | "partial" | "scarce" — §4.5
     vol_24h_input: float = 0.0,      # volume 24h de l'input — §4.6 input_speed_bonus
+    collection_active: bool = True,  # S1 momentum signal
 ) -> EVResult:
     """
     Calcule l'EV avec fallback sur les prix, détection de tendance et redistribution.
@@ -184,52 +224,73 @@ def calculate_ev(
             price = None
             reliability = "insufficient"
 
+            # 1. Sélection de la fenêtre (§4.3 adaptive windows)
             if out.volume_7d and out.volume_7d >= min_vol_7d and out.median_7d:
-                base = out.median_7d
-                # Règles 2-3 — Détection de tendance (seulement fenêtre 7j)
-                if out.avg_7d and out.avg_30d and out.avg_30d > 0:
-                    trend = (out.avg_7d - out.avg_30d) / out.avg_30d
-                    if trend < -0.15:
-                        price = base * (1 + trend * 0.5)
-                        reliability = "trending_down"
-                    elif trend > 0.15:
-                        price = base
-                        reliability = "trending_up"
-                    else:
-                        price = base
-                        reliability = "stable"
-                else:
-                    price = base
-                    reliability = "stable"
-            elif out.volume_30d and out.volume_30d >= 15 and out.median_30d:
+                price = out.median_7d
+                reliability = "high"
+            elif out.volume_30d and out.volume_30d >= min_vol_7d and out.median_30d:
                 price = out.median_30d
                 reliability = "medium"
+            elif out.avg_90d and out.avg_90d > 0:
+                price = out.avg_90d
+                reliability = "low"
             elif out.sell_price and out.sell_price > 0:
                 price = out.sell_price
                 reliability = "low"
 
+            if price:
+                # 2. Cap conservateur (§4.6 — ne pas surestimer si le spot est plus bas)
+                if out.sell_price and out.sell_price < price:
+                    price = out.sell_price
+
+                # 3. Détection de tendance et malus (§4.6)
+                if out.avg_7d and out.avg_30d and out.avg_30d > 0:
+                    trend = (out.avg_7d - out.avg_30d) / out.avg_30d
+                    if trend < -0.15:
+                        price = price * (1 + trend * 0.5)
+                        reliability += "_trending_down"
+                    elif trend > 0.15:
+                        reliability += "_trending_up"
+                    else:
+                        reliability += "_stable"
+                else:
+                    reliability += "_stable"
+
+                # 4. Doppler specialized weighting
+                price = get_doppler_ev(price, out.name)
+
             if price is None:
-                continue  # exclu — sa probabilité est redistribuée
-            if exclude_trending_down and reliability == "trending_down":
-                continue
+                continue  # exclu (données absentes) — sa probabilité est redistribuée
+
+            if exclude_trending_down and "trending_down" in reliability:
+                # Si on demande d'exclure les tendances baissières, on rejette tout le trade-up (§4.7.1)
+                raise ValueError("trending_down_excluded")
 
             # Étape 2b — Pénalité haute volatilité 24h (spec §4.3)
             # Si la variation 24h dépasse 15% vs la moyenne 7j → prix × 0.85
             if out.avg_7d and out.avg_7d > 0 and out.avg_24h:
                 if abs(out.avg_24h - out.avg_7d) / out.avg_7d > 0.15:
+                    if exclude_high_volatility:
+                        raise ValueError("high_volatility_excluded")
                     price *= 0.85
                     reliability = reliability + "_high_volatility"
 
-            valid_coll_outputs.append((out, price, reliability))
+            # Étape 2c — Pump detection
+            pump_val = detect_pump(out)
+            if pump_val > 0.7:
+                reliability += "_pump_detected"
+                price *= 0.7  # Strong haircut for potential manipulation
+
+            valid_coll_outputs.append((out, price, reliability, pump_val))
 
         if not valid_coll_outputs:
             continue
 
         # Redistribution des probabilités au sein de la collection
         prob_per_output = coll_prob_weight / len(valid_coll_outputs)
-        for out_obj, price, rel in valid_coll_outputs:
+        for out_obj, price, rel, p_val in valid_coll_outputs:
             out_obj.sell_price = price
-            processed_outputs.append((out_obj, prob_per_output, rel))
+            processed_outputs.append((out_obj, prob_per_output, rel, p_val))
 
     if not processed_outputs:
         raise ValueError("Aucun output valide après filtrage de fiabilité")
@@ -244,14 +305,14 @@ def calculate_ev(
             return 2
         return 1  # "low"
 
-    min_rank = min(_rel_rank(rel) for _, _, rel in processed_outputs)
+    min_rank = min(_rel_rank(rel) for _, _, rel, _ in processed_outputs)
     overall_reliability = {3: "high", 2: "medium", 1: "low"}[min_rank]
 
     pool_size = len(processed_outputs)
     nb_valid_outputs = pool_size
 
     # ÉTAPE 3 — EV brute = Σ(prob_i × prix_vente_redistribué_i)
-    ev_brute = sum(prob * out.sell_price for out, prob, _ in processed_outputs)
+    ev_brute = sum(prob * out.sell_price for out, prob, _, _ in processed_outputs)
 
     # ÉTAPE 4 — Coût ajusté (spec §4.3 : frais acheteur s'*ajoutent* au prix, (1 + fee_buy))
     cout_ajuste = sum(inp.buy_price * (1 + fee_buy) for inp in inputs)
@@ -264,32 +325,33 @@ def calculate_ev(
 
     # Liquidité output pondérée par probabilité (spec §4.6 — remplace max())
     liquidity_score = sum(
-        prob * (out.volume_7d or 0) for out, prob, _ in processed_outputs
+        prob * (out.volume_7d or 0) for out, prob, _, _ in processed_outputs
     ) / 7.0
 
     # win_prob sur prix NET après frais (spec §4.6 Étape 1 — corrigé)
     win_prob = sum(
-        prob for out, prob, _ in processed_outputs
+        prob for out, prob, _, _ in processed_outputs
         if out.sell_price * (1 - fee_sell) > cout_ajuste
     )
 
     ev_ajustee = ev_nette * win_prob
 
     # ── Coefficient de variation pondéré (spec §4.6 — remplace jackpot_ratio) ──
-    mean_pond = sum(prob * out.sell_price for out, prob, _ in processed_outputs)
-    var_pond  = sum(prob * (out.sell_price - mean_pond) ** 2 for out, prob, _ in processed_outputs)
+    mean_pond = sum(prob * out.sell_price for out, prob, _, _ in processed_outputs)
+    var_pond  = sum(prob * (out.sell_price - mean_pond) ** 2 for out, prob, _, _ in processed_outputs)
     cv_pond   = math.sqrt(var_pond) / mean_pond if mean_pond > 0 else 1.0
 
     # ── Floor ratio (spec §4.6 — protection pire outcome) ──
-    min_output_price = min(out.sell_price for out, _, _ in processed_outputs)
+    min_output_price = min(out.sell_price for out, _, _, _ in processed_outputs)
     floor_ratio = (min_output_price * (1 - fee_sell)) / cout_ajuste if cout_ajuste > 0 else 0.0
     floor_factor = 1.0 if floor_ratio >= 0.20 else (0.5 + floor_ratio * 2.5)
 
     # ── Détection haute volatilité 24h (spec §4.3 Étape 2b) ──
     # La pénalité × 0.85 sur le prix a déjà été appliquée par output dans la boucle ci-dessus.
     # On lève ici le flag global pour le score et l'affichage.
-    high_volatility = any("_high_volatility" in rel for _, _, rel in processed_outputs)
-    volatility_factor = 0.70 if high_volatility else 1.00
+    high_volatility = any("_high_volatility" in rel for _, _, rel, _ in processed_outputs)
+    pump_score = max(p_val for _, _, _, p_val in processed_outputs) if processed_outputs else 0.0
+    volatility_factor = 0.70 if high_volatility or pump_score > 0.5 else 1.00
 
     # ── Recipe velocity penalty (spec §4.7) ──
     # input_trend = (avg_24h_inputs - avg_7d_inputs) / avg_7d_inputs
@@ -310,7 +372,12 @@ def calculate_ev(
     # ── Vitesse d'exécution inputs (spec §4.6) ──
     input_speed_bonus = math.log1p(vol_24h_input)
 
-    # ── Kontract Score v3 complet (spec §4.6) ──
+    # ── Price Signal Momentum (spec §4.7.2) ──
+    pse = PriceSignalEngine()
+    momentum_data = pse.compute_momentum_score(collection_active)
+    momentum_multiplier = momentum_data["multiplier"]
+
+    # ── Kontract Score v4 complet (spec §4.6) ──
     bonus_liquidite = math.log1p(liquidity_score)
     kontract_score = (
         (ev_nette / math.sqrt(max(cv_pond, 0.01)))
@@ -321,7 +388,17 @@ def calculate_ev(
         * (1 + 0.15 * input_speed_bonus)
         * velocity_penalty
         * volatility_factor
+        * momentum_multiplier
     )
+
+    # ── Kelly Criterion (spec §4.6) ──
+    # Formula: K = W - (1 - W) / (ROI/100)
+    if roi > 0 and win_prob > 0:
+        b_ratio = roi / 100
+        kelly = win_prob - (1 - win_prob) / b_ratio
+        kelly_criterion = max(0.0, kelly * 100) # En %
+    else:
+        kelly_criterion = 0.0
 
     # ev_ajustee conservé pour affichage (win_prob en %) mais pas dans la formule du score
     ev_ajustee = ev_nette * win_prob
@@ -343,7 +420,7 @@ def calculate_ev(
             "avg_30d": out.avg_30d,
             "avg_90d": out.avg_90d,
         }
-        for out, prob, rel in sorted(processed_outputs, key=lambda x: x[0].sell_price, reverse=True)
+        for out, prob, rel, p_val in sorted(processed_outputs, key=lambda x: x[0].sell_price, reverse=True)
     ]
 
     return EVResult(
@@ -361,6 +438,10 @@ def calculate_ev(
         floor_ratio=round(floor_ratio, 4),
         kontract_score=round(kontract_score, 4),
         high_volatility=high_volatility,
+        pump_score=round(pump_score, 2),
+        momentum_score=momentum_data["momentum_score"],
+        momentum_multiplier=momentum_multiplier,
+        kelly_criterion=round(kelly_criterion, 1),
         price_reliability=overall_reliability,
         outputs=outputs_detail,
     )

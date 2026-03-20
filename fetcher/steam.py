@@ -16,6 +16,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from data.database import get_session
 from data.models import Price, Skin
+from data.throttler import Throttler
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,10 @@ async def fetch_steam_price(market_hash_name: str, currency: int = 3) -> dict | 
 
     Retourne dict avec lowest_price, median_price, volume ou None si erreur.
     """
+    if Throttler.is_rate_limited("steam"):
+        logger.warning("Steam: skipping price fetch due to active rate limit.")
+        return None
+
     params = {
         "appid": 730,
         "currency": currency,
@@ -38,7 +43,7 @@ async def fetch_steam_price(market_hash_name: str, currency: int = 3) -> dict | 
         try:
             resp = await client.get(STEAM_API_URL, params=params, timeout=15)
             if resp.status_code == 429:
-                logger.warning("Steam rate limit hit for %s", market_hash_name)
+                Throttler.mark_rate_limited("steam")
                 return None
             resp.raise_for_status()
             data = resp.json()
@@ -61,7 +66,7 @@ def _parse_steam_price(price_str: str | None) -> float | None:
         return None
 
 
-async def update_prices_from_steam(skin_ids: list[str] | None = None, delay: float = 1.5) -> dict:
+async def update_prices_from_steam(skin_ids: list[str] | None = None, delay: float = 3.0) -> dict:
     """
     Met à jour les prix Steam pour les skins indiqués (ou tous si None).
     `delay` (secondes) entre chaque requête pour respecter le rate limit.
