@@ -154,6 +154,29 @@ class BasketItem(Base):
     basket = relationship("TradeupBasket", back_populates="items")
 
 
+class SnipeAlert(Base):
+    """
+    Listing Skinport détecté en dessous du prix médian d'un input d'opportunité.
+    Créé en temps réel par le sniper WebSocket.
+    """
+    __tablename__ = "snipe_alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    skin_id = Column(String, ForeignKey("skins.id"), nullable=False)
+    market_hash_name = Column(String, nullable=False)
+    listing_price = Column(Float, nullable=False)   # prix du listing snipé
+    median_price = Column(Float, nullable=False)    # médiane de référence
+    discount_pct = Column(Float, nullable=False)    # remise en %
+    opp_combo_hash = Column(String, nullable=True)  # FK vers Opportunity
+    opp_roi_base = Column(Float, nullable=True)     # ROI de l'opp au prix médian
+    opp_roi_sniped = Column(Float, nullable=True)   # ROI recalculé avec le prix snipé
+    opp_kontract_score = Column(Float, nullable=True)
+    sale_id = Column(String, nullable=True)         # ID de la listing Skinport
+    item_url = Column(String, nullable=True)        # lien direct
+    detected_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="active")       # "active" | "expired" | "bought"
+
+
 class PandL(Base):
     """
     Historical P&L and Accuracy tracking (Spec §4.10)

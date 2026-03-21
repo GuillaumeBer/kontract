@@ -26,6 +26,7 @@ from data.bymykel import build_collections_db
 from data.database import init_db
 from engine.scanner import UserFilters, save_opportunities, scan_all_opportunities
 from fetcher.skinport import update_prices_from_skinport
+from fetcher.skinport_ws import SkinportSniper
 from fetcher.steam import update_prices_from_steam
 from engine.recommender import ActionRecommender
 from engine.output_detector import OutputDetector
@@ -173,6 +174,20 @@ async def startup() -> None:
     await job_fetch_and_scan()
 
 
+async def _sniper_telegram_broadcast(msg: str) -> None:
+    """Envoie une alerte snipe à tous les utilisateurs Telegram actifs."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        from data.database import get_session
+        from data.models import UserAlert
+        with get_session() as session:
+            chat_ids = [a.user_id for a in session.query(UserAlert).filter_by(active=True).all()]
+        await send_notifications([(cid, msg) for cid in chat_ids], TELEGRAM_BOT_TOKEN)
+    except Exception as e:
+        logger.error("Erreur broadcast Telegram snipe : %s", e)
+
+
 async def main() -> None:
     await startup()
 
@@ -192,6 +207,14 @@ async def main() -> None:
 
     scheduler.start()
     logger.info("Scheduler démarré (Ctrl+C pour arrêter)")
+
+    # Sniper WebSocket Skinport — tâche asyncio parallèle au scheduler
+    sniper = SkinportSniper(
+        snipe_discount=float(os.getenv("SNIPE_DISCOUNT", "0.12")),
+        telegram_notify_fn=_sniper_telegram_broadcast if TELEGRAM_BOT_TOKEN else None,
+    )
+    asyncio.create_task(sniper.run())
+    logger.info("Sniper WebSocket démarré (seuil %.0f%%)", float(os.getenv("SNIPE_DISCOUNT", "0.12")) * 100)
 
     # Démarrage optionnel du bot Telegram en parallèle
     if TELEGRAM_BOT_TOKEN:
