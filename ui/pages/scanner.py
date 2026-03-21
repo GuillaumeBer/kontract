@@ -52,7 +52,7 @@ with st.sidebar:
     min_roi = st.slider("ROI minimum (%)", 0, 100, 0, 5)  # Aligné sur main.py (0%)
     max_budget = st.number_input("Budget max (€)", 10.0, 10000.0, 400.0, 10.0)  # Aligné sur main.py (400€)
     max_pool = st.slider("Pool max", 1, 20, 15)  # Aligné sur main.py (15)
-    min_vol_sell = st.slider("Volume min (30j)", 0, 100, 10)  # Aligné sur main.py (10)
+    min_vol_sell = st.slider("Volume min outputs (7j)", 0, 100, 10)  # seuil min_vol_7d pour fiabilité prix outputs
     min_liq = st.slider("Liquidité min (score)", 0.0, 10.0, 0.0, 0.5)  # Spec §4.5 — 0 = voir toutes les opps
     min_vol_input = st.slider("Volume input min (ventes/j)", 0.0, 5.0, 0.1, 0.1)  # Filtre input
     exclude_down = st.checkbox("Exclure tendances baissières", False)
@@ -64,11 +64,8 @@ with st.sidebar:
     sort_by = st.selectbox("Trier par", ["Kontract Score", "ROI (%)", "EV nette (€)", "Win prob (%)"], 0)
     scan_btn = st.button("🔍 Lancer le Scan", type="primary", use_container_width=True)
 
-# logic
-# Generate active filters signature to detect changes
-current_filters_sig = f"{min_roi}-{max_budget}-{max_pool}-{min_vol_sell}-{min_vol_input}-{exclude_down}-{exclude_volatility}-{min_ks}-{source_buy}-{source_sell}"
-
-if "filters_sig" not in st.session_state or st.session_state["filters_sig"] != current_filters_sig or scan_btn:
+# logic — scan déclenché uniquement par le bouton (pas auto sur chaque changement de filtre)
+if scan_btn or "opportunities" not in st.session_state:
     filters = UserFilters(
         min_roi=float(min_roi), max_budget=max_budget, max_pool_size=max_pool,
         min_volume_sell_price=min_vol_sell, min_liquidity=min_liq,
@@ -80,7 +77,6 @@ if "filters_sig" not in st.session_state or st.session_state["filters_sig"] != c
     with st.spinner("Recherche des meilleures opportunités..."):
         opps = _run_scan(filters)
     st.session_state["opportunities"] = opps
-    st.session_state["filters_sig"] = current_filters_sig
 else:
     opps = st.session_state.get("opportunities", [])
 

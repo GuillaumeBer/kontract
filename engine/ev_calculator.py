@@ -300,13 +300,14 @@ def calculate_ev(
 
     # Fiabilité globale = le pire cas parmi les outputs
     def _rel_rank(rel: str) -> int:
-        # Normaliser : retirer les suffixes secondaires (_high_volatility, _price_divergence)
-        base = rel.replace("_high_volatility", "").replace("_price_divergence", "").rstrip("_")
-        if base in ("stable", "trending_up"):
+        # La fiabilité est toujours préfixée par "high", "medium" ou "low"
+        # suivi d'un suffixe (_stable, _trending_down, _high_volatility, etc.)
+        # On extrait uniquement le premier composant (le niveau de base).
+        if rel.startswith("high"):
             return 3
-        if base in ("medium", "trending_down"):
+        if rel.startswith("medium"):
             return 2
-        return 1  # "low"
+        return 1  # "low" ou insuffisant
 
     min_rank = min(_rel_rank(rel) for _, _, rel, _ in processed_outputs)
     overall_reliability = {3: "high", 2: "medium", 1: "low"}[min_rank]

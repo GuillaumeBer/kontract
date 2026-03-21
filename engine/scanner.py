@@ -321,8 +321,8 @@ def scan_all_opportunities(filters: UserFilters | None = None) -> list[dict]:
             if input_vol_24h < filters.min_volume_input:
                 continue
 
-            # Filtre quantité minimum (exécutabilité) — exclure les items en rupture
-            if quantity is not None and quantity < 1:
+            # Filtre quantité minimum (exécutabilité) — exclure les items insuffisamment disponibles
+            if quantity is not None and quantity < filters.min_quantity_input:
                 continue
 
             # Règle Covert post-oct 2025 : rarity_ancient_weapon → 5 inputs (spec §4.4)
