@@ -208,13 +208,13 @@ async def main() -> None:
     scheduler.start()
     logger.info("Scheduler démarré (Ctrl+C pour arrêter)")
 
-    # Sniper WebSocket Skinport — tâche asyncio parallèle au scheduler
+    # Sniper REST Skinport — tâche asyncio parallèle au scheduler (poll toutes les 90s)
     sniper = SkinportSniper(
         snipe_discount=float(os.getenv("SNIPE_DISCOUNT", "0.12")),
         telegram_notify_fn=_sniper_telegram_broadcast if TELEGRAM_BOT_TOKEN else None,
     )
     asyncio.create_task(sniper.run())
-    logger.info("Sniper WebSocket démarré (seuil %.0f%%)", float(os.getenv("SNIPE_DISCOUNT", "0.12")) * 100)
+    logger.info("Sniper REST démarré (seuil %.0f%%)", float(os.getenv("SNIPE_DISCOUNT", "0.12")) * 100)
 
     # Démarrage optionnel du bot Telegram en parallèle
     if TELEGRAM_BOT_TOKEN:

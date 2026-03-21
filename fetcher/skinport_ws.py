@@ -1,23 +1,21 @@
 """
 Module fetcher/skinport_ws.py
-Sniper temps réel via le feed Socket.IO public de Skinport.
+Sniper temps réel via l'API REST publique Skinport.
 
-Surveille les nouveaux listings CS2 et déclenche une alerte immédiate
-quand un skin est listé en dessous de (median × (1 - snipe_discount))
-ET que ce skin est un input d'une opportunité trade-up connue.
+Stratégie : poll /v1/items toutes les POLL_INTERVAL secondes.
+Chaque item expose min_price (= prix du listing le moins cher disponible).
+Si min_price ≤ median_ref × (1 - snipe_discount) et que le skin est
+un input d'une opportunité connue → alerte snipe.
 
-Architecture :
-  - Connexion persistante Socket.IO v4 à wss://skinport.com
-  - Index en mémoire (watch_list) chargé depuis BDD : market_hash_name → opp data
-  - Rafraîchissement de l'index toutes les REFRESH_INTERVAL secondes
-  - Calcul du ROI boosté : (ev_nette + savings) / (cout_ajuste - savings) × 100
-  - Sauvegarde en BDD (SnipeAlert) + notification Telegram optionnelle
+Déduplication : une alerte par (market_hash_name, prix_déclenché).
+Re-alerte si le prix descend encore de plus de 2%, ou si le listing
+disparaît puis réapparaît.
 
-Format du feed Skinport saleFeed :
-  {"appid": 730, "sales": [{"id": 123, "market_hash_name": "...",
-                             "salePrice": 1234, "currency": "EUR",
-                             "url": "/item/csgo/..."}]}
-  salePrice est en centimes (1234 = 12.34 EUR).
+Pourquoi pas WebSocket ?
+  Le feed Socket.IO de Skinport est protégé par Cloudflare (HTTP 403
+  sans cookies de session navigateur réels). L'API REST publique
+  (api.skinport.com/v1/items) est accessible sans authentification
+  et retourne min_price en temps quasi-réel (~3-4 min de fraîcheur).
 """
 
 import asyncio
@@ -25,18 +23,22 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable, Awaitable
 
-import socketio
+import httpx
 
 from data.database import get_session
 from data.models import Opportunity, Price, Skin, SnipeAlert
 
 logger = logging.getLogger(__name__)
 
-SKINPORT_WS_URL = "wss://skinport.com"
+SKINPORT_API_URL = "https://api.skinport.com/v1/items"
 SKINPORT_APPID = 730
 SKINPORT_CURRENCY = "EUR"
-DEFAULT_SNIPE_DISCOUNT = 0.12   # seuil par défaut : -12% vs médiane
+
+DEFAULT_SNIPE_DISCOUNT = 0.12   # seuil par défaut : -12 % vs médiane
+POLL_INTERVAL = 90              # secondes entre deux polls (données refresh ~3-4min)
 REFRESH_INTERVAL = 300          # rafraîchissement watch list (secondes)
+RETRIGGER_DROP = 0.02           # re-alerter si prix redescend encore de 2 %
+RATE_LIMIT_FALLBACK_WAIT = 120  # secondes à attendre si 429 sans Retry-After
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ def format_snipe_message(entry: dict, listing_price: float, discount_pct: float,
 
 class SkinportSniper:
     """
-    Connecteur Socket.IO Skinport avec détection de snipes en temps réel.
+    Sniper REST-polling sur l'API Skinport.
 
     Usage dans main.py :
         sniper = SkinportSniper(snipe_discount=0.12, telegram_notify_fn=...)
@@ -80,47 +82,31 @@ class SkinportSniper:
         self.snipe_discount = snipe_discount
         self.telegram_notify_fn = telegram_notify_fn
         self._watch_list: dict[str, dict] = {}
-        self._sio = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_attempts=0,   # infini
-            reconnection_delay=5,
-            reconnection_delay_max=60,
-            logger=False,
-            engineio_logger=False,
+        # Déduplication : mhn → dernier prix qui a déclenché une alerte
+        self._last_snipe: dict[str, float] = {}
+        # Cache ETag pour requêtes conditionnelles (évite de retraiter des données inchangées)
+        self._etag: str | None = None
+        self._http = httpx.AsyncClient(
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json",
+            },
+            timeout=20,
+            follow_redirects=True,
         )
-        self._register_handlers()
-
-    def _register_handlers(self) -> None:
-        sio = self._sio
-
-        @sio.event
-        async def connect():
-            logger.info("Skinport WS connecté — souscription au feed CS2 (appid=%d)", SKINPORT_APPID)
-            await sio.emit("saleFeedSubscribe", {
-                "appid": SKINPORT_APPID,
-                "currency": SKINPORT_CURRENCY,
-            })
-
-        @sio.event
-        async def disconnect():
-            logger.warning("Skinport WS déconnecté — reconnexion automatique en cours...")
-
-        @sio.event
-        async def connect_error(data):
-            logger.error("Skinport WS erreur de connexion : %s", data)
-
-        @sio.on("saleFeed")
-        async def on_sale_feed(data):
-            await self._process_sale_feed(data)
 
     # -----------------------------------------------------------------------
-    # Watch list
+    # Watch list (index BDD → mémoire)
     # -----------------------------------------------------------------------
 
     async def refresh_watch_list(self) -> None:
         """
         Recharge depuis la BDD la liste des skins à surveiller.
-        index : market_hash_name → {skin_id, median_price, opp_data, ...}
+        Index : market_hash_name → {skin_id, median_price, opp_data, ...}
         """
         watch: dict[str, dict] = {}
 
@@ -172,56 +158,95 @@ class SkinportSniper:
         logger.info("Watch list sniper rafraîchie : %d skins surveillés", len(watch))
 
     # -----------------------------------------------------------------------
-    # Traitement du feed
+    # Poll REST
     # -----------------------------------------------------------------------
 
-    async def _process_sale_feed(self, data: dict) -> None:
-        sales = data.get("sales", [])
-        for sale in sales:
-            mhn = sale.get("market_hash_name", "")
-            if mhn not in self._watch_list:
-                continue
+    async def _fetch_listings(self) -> dict[str, float] | None:
+        """
+        Appelle GET /v1/items et retourne {market_hash_name: min_price}.
+        min_price = prix du listing le moins cher disponible sur Skinport.
 
-            # salePrice est en centimes sur Skinport (ex: 1234 = 12.34€)
-            raw_price = sale.get("salePrice", 0)
-            listing_price = raw_price / 100.0
-            if listing_price <= 0:
+        Retourne None si les données n'ont pas changé depuis le dernier poll (304).
+        Lève httpx.HTTPStatusError(429) si rate-limited.
+        """
+        headers = {}
+        if self._etag:
+            headers["If-None-Match"] = self._etag
+
+        resp = await self._http.get(
+            SKINPORT_API_URL,
+            params={"app_id": SKINPORT_APPID, "currency": SKINPORT_CURRENCY},
+            headers=headers,
+        )
+
+        if resp.status_code == 304:
+            logger.debug("Poll Skinport : données inchangées (304 Not Modified)")
+            return None  # rien à retraiter
+
+        resp.raise_for_status()  # lève HTTPStatusError pour 429, 5xx, etc.
+
+        if etag := resp.headers.get("etag"):
+            self._etag = etag
+
+        data = resp.json()
+        return {
+            item["market_hash_name"]: item["min_price"]
+            for item in data
+            if item.get("min_price") and item.get("min_price") > 0
+        }
+
+    async def _process_listings(self, listings: dict[str, float]) -> None:
+        """
+        Compare les prix courants à la watch list et déclenche les snipes.
+        """
+        # Nettoyer les entrées expirées (listing disparu → reset dédup)
+        to_remove = [
+            mhn for mhn in list(self._last_snipe)
+            if mhn not in listings
+               or listings[mhn] > self._watch_list.get(mhn, {}).get("median_price", 0)
+               * (1.0 - self.snipe_discount) * 1.05
+        ]
+        for mhn in to_remove:
+            del self._last_snipe[mhn]
+
+        for mhn, min_price in listings.items():
+            if mhn not in self._watch_list:
                 continue
 
             entry = self._watch_list[mhn]
             median = entry["median_price"]
             threshold = median * (1.0 - self.snipe_discount)
 
-            if listing_price > threshold:
+            if min_price > threshold:
                 continue  # pas suffisamment sous le marché
 
-            discount_pct = (median - listing_price) / median * 100.0
+            # Déduplication : ne re-alerter que si le prix baisse encore
+            prev = self._last_snipe.get(mhn)
+            if prev is not None and min_price >= prev * (1.0 - RETRIGGER_DROP):
+                continue  # même listing déjà signalé, pas assez de drop supplémentaire
+
+            discount_pct = (median - min_price) / median * 100.0
 
             # ROI boosté : 1 input acheté au prix snipé, le reste au médian
-            # ev_nette reste identique (dépend des outputs), coût diminue
-            savings = median - listing_price
+            savings = median - min_price
             new_cout = max(entry["opp_cout_ajuste"] - savings, 0.01)
             new_ev_nette = entry["opp_ev_nette"] + savings
             roi_sniped = (new_ev_nette / new_cout) * 100.0
 
-            sale_id = str(sale.get("id", ""))
-            raw_url = sale.get("url", "")
-            item_url = (
-                f"https://skinport.com{raw_url}" if raw_url
-                else entry["item_page"]
-            )
+            item_url = entry["item_page"] or f"https://skinport.com/market?item={mhn}"
 
             logger.info(
                 "🎯 SNIPE : %s @ %.2f€ (médiane %.2f€, -%.1f%%) | ROI %.1f%% → %.1f%%",
-                mhn, listing_price, median, discount_pct,
+                mhn, min_price, median, discount_pct,
                 entry["opp_roi"], roi_sniped,
             )
 
-            await self._save_snipe(entry, listing_price, discount_pct,
-                                   roi_sniped, sale_id, item_url)
+            self._last_snipe[mhn] = min_price
+
+            await self._save_snipe(entry, min_price, discount_pct, roi_sniped, item_url)
 
             if self.telegram_notify_fn:
-                msg = format_snipe_message(entry, listing_price, discount_pct,
+                msg = format_snipe_message(entry, min_price, discount_pct,
                                            roi_sniped, item_url)
                 try:
                     await self.telegram_notify_fn(msg)
@@ -229,7 +254,7 @@ class SkinportSniper:
                     logger.error("Erreur notification Telegram snipe : %s", e)
 
     async def _save_snipe(self, entry: dict, listing_price: float, discount_pct: float,
-                           roi_sniped: float, sale_id: str, item_url: str) -> None:
+                           roi_sniped: float, item_url: str) -> None:
         try:
             with get_session() as session:
                 session.add(SnipeAlert(
@@ -242,7 +267,7 @@ class SkinportSniper:
                     opp_roi_base=round(entry["opp_roi"], 2),
                     opp_roi_sniped=round(roi_sniped, 2),
                     opp_kontract_score=round(entry["opp_kontract_score"], 4),
-                    sale_id=sale_id,
+                    sale_id=None,
                     item_url=item_url,
                     detected_at=datetime.now(timezone.utc),
                     status="active",
@@ -257,27 +282,55 @@ class SkinportSniper:
 
     async def run(self) -> None:
         """
-        Lance le sniper : connexion WS persistante + refresh périodique de l'index.
-        Gère la reconnexion automatique en cas de coupure.
+        Lance le sniper : polling REST toutes les POLL_INTERVAL secondes.
+        Refresh de la watch list toutes les REFRESH_INTERVAL secondes.
         """
         await self.refresh_watch_list()
+        last_refresh = asyncio.get_event_loop().time()
 
-        async def _refresh_loop() -> None:
-            while True:
-                await asyncio.sleep(REFRESH_INTERVAL)
-                await self.refresh_watch_list()
-
-        asyncio.create_task(_refresh_loop())
+        consecutive_errors = 0
+        logger.info(
+            "Sniper REST Skinport démarré (poll toutes les %ds, seuil -%.0f%%)",
+            POLL_INTERVAL, self.snipe_discount * 100,
+        )
 
         while True:
+            wait = POLL_INTERVAL
             try:
-                logger.info("Connexion au feed Skinport WebSocket...")
-                await self._sio.connect(
-                    SKINPORT_WS_URL,
-                    transports=["websocket"],
-                    socketio_path="/socket.io/",
-                )
-                await self._sio.wait()
+                # Rafraîchir la watch list si besoin
+                now = asyncio.get_event_loop().time()
+                if now - last_refresh >= REFRESH_INTERVAL:
+                    await self.refresh_watch_list()
+                    last_refresh = now
+
+                listings = await self._fetch_listings()
+                if listings is not None:
+                    logger.debug("Poll Skinport : %d items reçus", len(listings))
+                    await self._process_listings(listings)
+                consecutive_errors = 0
+
+            except httpx.HTTPStatusError as e:
+                consecutive_errors += 1
+                status = e.response.status_code
+                if status == 429:
+                    # Rate-limited : respecter Retry-After ou attente par défaut
+                    retry_after = e.response.headers.get("retry-after")
+                    wait = int(retry_after) if retry_after and retry_after.isdigit() else RATE_LIMIT_FALLBACK_WAIT
+                    logger.warning(
+                        "API Skinport : rate limit (429). Pause de %ds avant prochain poll.", wait
+                    )
+                else:
+                    wait = min(POLL_INTERVAL * (2 ** min(consecutive_errors - 1, 4)), 600)
+                    logger.warning("API Skinport HTTP %s — retry dans %ds", status, wait)
+
+            except httpx.RequestError as e:
+                consecutive_errors += 1
+                wait = min(POLL_INTERVAL * (2 ** min(consecutive_errors - 1, 4)), 600)
+                logger.warning("API Skinport réseau : %s — retry dans %ds", e, wait)
+
             except Exception as e:
-                logger.error("Skinport WS erreur inattendue : %s — retry dans 15s", e)
-                await asyncio.sleep(15)
+                consecutive_errors += 1
+                wait = min(POLL_INTERVAL * (2 ** min(consecutive_errors - 1, 4)), 600)
+                logger.error("Sniper erreur inattendue : %s — retry dans %ds", e, wait)
+
+            await asyncio.sleep(wait)

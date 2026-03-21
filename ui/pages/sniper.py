@@ -16,8 +16,8 @@ from ui.utils import render_header
 render_header("⚡ Sniper Temps Réel")
 
 st.info(
-    "Le sniper surveille le feed WebSocket Skinport en continu. "
-    "Cette page affiche les listings détectés en dessous du seuil de remise configuré dans `main.py`."
+    "Le sniper poll l'API Skinport toutes les 90s et détecte les listings "
+    "en dessous du seuil de remise configuré dans `main.py` (env var `SNIPE_DISCOUNT`, défaut 12%)."
 )
 
 # ── Sidebar filtres ──────────────────────────────────────────────────────────
