@@ -14,6 +14,7 @@ st.set_page_config(
 pg = st.navigation([
     st.Page("pages/plan.py", title="Plan d'Action", icon="📋"),
     st.Page("pages/scanner.py", title="Scanner EV", icon="🔍"),
+    st.Page("pages/sniper.py", title="Sniper", icon="⚡"),
     st.Page("pages/portfolio.py", title="Portefeuille", icon="💼"),
     st.Page("pages/calculateur.py", title="Calculateur", icon="🧮"),
     st.Page("pages/pl.py", title="Analyse P&L", icon="📈"),
