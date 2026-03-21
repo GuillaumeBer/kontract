@@ -15,10 +15,10 @@ from dataclasses import dataclass, field
 from engine.momentum import PriceSignalEngine
 
 # Frais par plateforme (spec §4.3 — centralisés et versionnés)
-# Skinport : frais acheteur = 0% (prix affiché = prix payé), 3% côté vendeur
+# Skinport : frais acheteur = 0% (prix affiché = prix payé), 8% côté vendeur (tarif standard depuis 2025)
 # Steam    : prix affiché inclut déjà les 15% vendeur — 0% frais acheteur supplémentaires
 FEES = {
-    "skinport": {"buy": 0.00, "sell": 0.03},
+    "skinport": {"buy": 0.00, "sell": 0.08},
     "steam":    {"buy": 0.00, "sell": 0.15},
 }
 

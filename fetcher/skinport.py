@@ -48,7 +48,7 @@ async def fetch_items(currency: str = "EUR") -> list[dict]:
         try:
             resp = await client.get(
                 f"{BASE_URL}/items",
-                params={"app_id": 730, "currency": currency, "tradable": 0},
+                params={"app_id": 730, "currency": currency, "tradable": 1},
                 headers=BROTLI_HEADERS,
                 timeout=30,
             )

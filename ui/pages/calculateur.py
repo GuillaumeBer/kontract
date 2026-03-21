@@ -73,19 +73,49 @@ if calc_btn:
                 p = prices_idx.get(out_id)
                 s = next((sk for sk in all_skins if sk.id == out_id), None)
                 if s:
-                    outputs_by_coll[selected_coll_id].append(OutputSkin(out_id, s.name, p.sell_price if p else 0, volume_7d=p.volume_7d if p else 0))
-            
+                    outputs_by_coll[selected_coll_id].append(OutputSkin(
+                        skin_id=out_id, name=s.name,
+                        sell_price=p.sell_price if p else 0,
+                        volume_24h=p.volume_24h or 0.0 if p else 0.0,
+                        volume_7d=p.volume_7d or 0.0 if p else 0.0,
+                        volume_30d=p.volume_30d or 0.0 if p else 0.0,
+                        quantity=p.quantity or 0 if p else 0,
+                        median_24h=p.median_24h if p else None,
+                        median_7d=p.median_7d if p else None,
+                        median_30d=p.median_30d if p else None,
+                        median_90d=p.median_90d if p else None,
+                        avg_24h=p.avg_24h if p else None,
+                        avg_7d=p.avg_7d if p else None,
+                        avg_30d=p.avg_30d if p else None,
+                        avg_90d=p.avg_90d if p else None,
+                    ))
+
             if use_fillers and filler_skin:
                 f_price = prices_idx[filler_skin.id].buy_price
                 inputs += [InputSkin(filler_skin.id, filler_skin.name, filler_skin.collection_id, filler_skin.rarity_id, f_price) for _ in range(3)]
-                
+
                 f_out_ids = [tp.output_skin_id for tp in session.query(TradeupPool).filter_by(input_skin_id=filler_skin.id).all()]
                 outputs_by_coll[filler_skin.collection_id] = []
                 for out_id in f_out_ids:
                     p = prices_idx.get(out_id)
                     s = next((sk for sk in all_skins if sk.id == out_id), None)
                     if s:
-                        outputs_by_coll[filler_skin.collection_id].append(OutputSkin(out_id, s.name, p.sell_price if p else 0, volume_7d=p.volume_7d if p else 0))
+                        outputs_by_coll[filler_skin.collection_id].append(OutputSkin(
+                            skin_id=out_id, name=s.name,
+                            sell_price=p.sell_price if p else 0,
+                            volume_24h=p.volume_24h or 0.0 if p else 0.0,
+                            volume_7d=p.volume_7d or 0.0 if p else 0.0,
+                            volume_30d=p.volume_30d or 0.0 if p else 0.0,
+                            quantity=p.quantity or 0 if p else 0,
+                            median_24h=p.median_24h if p else None,
+                            median_7d=p.median_7d if p else None,
+                            median_30d=p.median_30d if p else None,
+                            median_90d=p.median_90d if p else None,
+                            avg_24h=p.avg_24h if p else None,
+                            avg_7d=p.avg_7d if p else None,
+                            avg_30d=p.avg_30d if p else None,
+                            avg_90d=p.avg_90d if p else None,
+                        ))
 
             try:
                 res = calculate_ev(inputs, outputs_by_coll)
