@@ -137,6 +137,7 @@ class OutputSkin:
     volume_24h: float = 0.0
     volume_7d: float = 0.0
     volume_30d: float = 0.0
+    quantity: int = 0          # listings disponibles sur Skinport (proxy liquidité si volume_7d=0)
     median_24h: float = None
     median_7d: float = None
     median_30d: float = None
@@ -325,9 +326,11 @@ def calculate_ev(
 
     pool_score = 1 / pool_size
 
-    # Liquidité output pondérée par probabilité (spec §4.6 — remplace max())
+    # Liquidité output pondérée par probabilité (spec §4.6)
+    # Si volume_7d absent, on utilise quantity/4 comme proxy (4 listings ≈ 1 vente/semaine estimée)
     liquidity_score = sum(
-        prob * (out.volume_7d or 0) for out, prob, _, _ in processed_outputs
+        prob * (out.volume_7d or max(0, (out.quantity or 0) / 4))
+        for out, prob, _, _ in processed_outputs
     ) / 7.0
 
     # win_prob sur prix NET après frais (spec §4.6 Étape 1 — corrigé)
